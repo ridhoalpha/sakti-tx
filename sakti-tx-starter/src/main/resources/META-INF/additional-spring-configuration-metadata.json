@@ -1,0 +1,47 @@
+{
+  "groups": [
+    {
+      "name": "sakti.tx",
+      "type": "id.go.kemenkeu.djpbn.sakti.tx.starter.config.SaktiTxProperties",
+      "sourceType": "id.go.kemenkeu.djpbn.sakti.tx.starter.config.SaktiTxProperties"
+    }
+  ],
+  "properties": [
+    {
+      "name": "sakti.tx.dragonfly.enabled",
+      "type": "java.lang.Boolean",
+      "defaultValue": false,
+      "description": "Enable Dragonfly/Redis integration"
+    },
+    {
+      "name": "sakti.tx.dragonfly.url",
+      "type": "java.lang.String",
+      "defaultValue": "redis://localhost:6379",
+      "description": "Dragonfly connection URL"
+    },
+    {
+      "name": "sakti.tx.lock.enabled",
+      "type": "java.lang.Boolean",
+      "defaultValue": false,
+      "description": "Enable distributed lock feature"
+    },
+    {
+      "name": "sakti.tx.cache.enabled",
+      "type": "java.lang.Boolean",
+      "defaultValue": false,
+      "description": "Enable cache feature"
+    },
+    {
+      "name": "sakti.tx.idempotency.enabled",
+      "type": "java.lang.Boolean",
+      "defaultValue": false,
+      "description": "Enable idempotency protection"
+    },
+    {
+      "name": "sakti.tx.multi-db.enabled",
+      "type": "java.lang.Boolean",
+      "defaultValue": false,
+      "description": "Enable multi-database transaction support"
+    }
+  ]
+}

@@ -1,25 +1,56 @@
-# sakti-tx (v1.0.0)
+# SAKTI Transaction Coordinator v1.0.0
 
-This project is a multi-module Maven library implementing the Application-Level Transaction Coordinator (ALTC) pattern with Redisson/Dragonfly locking, idempotency, JMS publisher, tx-log and recovery worker. It includes an example Spring Boot app demonstrating usage.
+Distributed transaction management for SAKTI microservices.
 
-## Build
-From /mnt/data/sakti-tx-1.0.0 run:
+## Quick Start
 
+### 1. Add Dependency
+```xml
+<dependency>
+    <groupId>id.go.kemenkeu.djpbn.sakti</groupId>
+    <artifactId>sakti-tx-starter</artifactId>
+    <version>1.0.0</version>
+</dependency>
+
+<!-- If using Dragonfly features -->
+<dependency>
+    <groupId>org.redisson</groupId>
+    <artifactId>redisson-spring-boot-starter</artifactId>
+    <version>3.41.0</version>
+</dependency>
 ```
-mvn -DskipTests clean install
+
+### 2. Configure
+```properties
+sakti.tx.dragonfly.enabled=true
+sakti.tx.dragonfly.url=redis://dragonfly:6379
+sakti.tx.dragonfly.password=${DRAGONFLY_PASSWORD}
+sakti.tx.lock.enabled=true
 ```
 
-## Example
-Start the example app (it uses in-memory H2 DB for demonstration):
-
+### 3. Use
+```java
+@Service
+public class YourService {
+    
+    @SaktiLock(key = "'order:' + #orderId")
+    @Transactional
+    public OrderDto process(String orderId) {
+        // Your code here
+    }
+}
 ```
-cd sakti-tx-example
-mvn -DskipTests spring-boot:run
-```
 
-The example registers three Datasources (maindb, db1, db2) and demonstrates `@SaktiTransactional` usage in `SampleService`.
+## Features
 
-## Notes
-- Configure `sakti.tx` properties in `application.yml` as needed (Redis/Dragonfly address, lock/ttl values, JMS broker).
-- For production, provide a RedissonClient configured to your Dragonfly operator cluster and a pooled JMS ConnectionFactory.
-- This code is compatible with Java 8 runtime and later.
+- ✅ Distributed Lock (Dragonfly/Redisson)
+- ✅ Cache Management
+- ✅ Idempotency Protection
+- ✅ Multi-DB Transaction (Compensating Rollback)
+- ✅ Circuit Breaker
+- ✅ Optional JMS Event Publishing
+- ✅ All features independently configurable
+
+## Documentation
+
+See `/docs` for complete guide.
