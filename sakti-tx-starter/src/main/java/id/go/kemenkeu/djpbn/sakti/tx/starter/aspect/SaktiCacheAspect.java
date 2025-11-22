@@ -1,5 +1,6 @@
 package id.go.kemenkeu.djpbn.sakti.tx.starter.aspect;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import id.go.kemenkeu.djpbn.sakti.tx.core.cache.CacheManager;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.annotation.SaktiCache;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.config.SaktiTxProperties;
@@ -16,6 +17,7 @@ import org.springframework.expression.spel.support.StandardEvaluationContext;
 import org.springframework.stereotype.Component;
 
 import java.lang.reflect.Method;
+import java.lang.reflect.Type;
 
 @Aspect
 @Component
@@ -23,15 +25,15 @@ public class SaktiCacheAspect {
     
     private static final Logger log = LoggerFactory.getLogger(SaktiCacheAspect.class);
     
-    private final CacheManager cacheManager;
+    private final CacheManager saktiCacheManager;
     private final SaktiTxProperties properties;
     private final DragonflyHealthIndicator healthIndicator;
     private final ExpressionParser parser = new SpelExpressionParser();
     
-    public SaktiCacheAspect(CacheManager cacheManager,
+    public SaktiCacheAspect(CacheManager saktiCacheManager,
                            SaktiTxProperties properties,
                            DragonflyHealthIndicator healthIndicator) {
-        this.cacheManager = cacheManager;
+        this.saktiCacheManager = saktiCacheManager;
         this.properties = properties;
         this.healthIndicator = healthIndicator;
     }
@@ -51,10 +53,25 @@ public class SaktiCacheAspect {
         String cacheKey = evaluateExpression(annotation.key(), context, 
             properties.getCache().getPrefix() + method.getName());
         
-        Class<?> returnType = annotation.returnType() != Object.class ? 
-            annotation.returnType() : method.getReturnType();
+        Object cached = null;
         
-        Object cached = cacheManager.get(cacheKey, returnType);
+        if (annotation.returnType() != Object.class) {
+            // Explicit returnType (for simple types or backward compatibility)
+            log.debug("Using explicit returnType: {}", annotation.returnType().getSimpleName());
+            cached = saktiCacheManager.get(cacheKey, annotation.returnType());
+        } else {
+            // Auto-detect from method signature (for generic types)
+            log.debug("Auto-detecting return type from method signature");
+            Type genericReturnType = method.getGenericReturnType();
+            TypeReference<Object> typeRef = new TypeReference<Object>() {
+                @Override
+                public Type getType() {
+                    return genericReturnType;
+                }
+            };
+            cached = saktiCacheManager.get(cacheKey, typeRef);
+        }
+        
         if (cached != null) {
             log.debug("Cache hit: {}", cacheKey);
             return cached;
@@ -66,7 +83,7 @@ public class SaktiCacheAspect {
         if (result != null) {
             long ttl = annotation.ttlSeconds() > 0 ? 
                 annotation.ttlSeconds() : properties.getCache().getDefaultTtlSeconds();
-            cacheManager.put(cacheKey, result, ttl);
+            saktiCacheManager.put(cacheKey, result, ttl);
         }
         
         return result;

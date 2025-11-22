@@ -6,62 +6,116 @@
     <parent>
         <groupId>id.go.kemenkeu.djpbn.sakti</groupId>
         <artifactId>sakti-tx-parent</artifactId>
-        <version>1.0.0</version>
+        <version>1.0.2</version>
     </parent>
     <modelVersion>4.0.0</modelVersion>
     <artifactId>sakti-tx-starter</artifactId>
+    <packaging>jar</packaging>
+    
+    <name>SAKTI Transaction Starter</name>
+    <description>Spring Boot starter with auto-configuration</description>
     
     <dependencies>
+        <!-- Core Module -->
         <dependency>
             <groupId>id.go.kemenkeu.djpbn.sakti</groupId>
             <artifactId>sakti-tx-core</artifactId>
             <version>${project.version}</version>
         </dependency>
         
+        <!-- Spring Boot Starter (NO WEB!) -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter</artifactId>
         </dependency>
         
+        <!-- Spring AOP for Aspects -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-aop</artifactId>
         </dependency>
         
+        <!-- OPTIONAL: Redisson Spring Boot Starter -->
         <dependency>
             <groupId>org.redisson</groupId>
             <artifactId>redisson-spring-boot-starter</artifactId>
             <optional>true</optional>
         </dependency>
         
+        <!-- OPTIONAL: Spring Data Redis (if needed for compatibility) -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-redis</artifactId>
             <optional>true</optional>
+            <exclusions>
+                <!-- Exclude Lettuce, we use Redisson -->
+                <exclusion>
+                    <groupId>io.lettuce</groupId>
+                    <artifactId>lettuce-core</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         
+        <!-- OPTIONAL: ActiveMQ Artemis Jakarta Client -->
         <dependency>
             <groupId>org.apache.activemq</groupId>
             <artifactId>artemis-jakarta-client</artifactId>
             <optional>true</optional>
         </dependency>
         
+        <!-- OPTIONAL: Jakarta JMS API -->
+        <dependency>
+            <groupId>jakarta.jms</groupId>
+            <artifactId>jakarta.jms-api</artifactId>
+            <optional>true</optional>
+        </dependency>
+        
+        <!-- OPTIONAL: Spring Boot Actuator (for health checks) -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
             <optional>true</optional>
         </dependency>
         
+        <!-- Configuration Processor (for IDE autocomplete) -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-configuration-processor</artifactId>
             <optional>true</optional>
         </dependency>
         
+        <!-- Test Dependencies -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
     </dependencies>
+    
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+            </plugin>
+            
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <configuration>
+                    <archive>
+                        <manifestEntries>
+                            <Implementation-Title>${project.name}</Implementation-Title>
+                            <Implementation-Version>${project.version}</Implementation-Version>
+                        </manifestEntries>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 </project>

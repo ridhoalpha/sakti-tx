@@ -1,5 +1,6 @@
 package id.go.kemenkeu.djpbn.sakti.tx.core.cache;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.redisson.api.RBucket;
 import org.redisson.api.RedissonClient;
@@ -27,6 +28,10 @@ public class CacheManager {
         this.prefix = (prefix == null || prefix.trim().isEmpty()) ? "sakti:cache:" : prefix;
     }
     
+    /**
+     * Get cache with Class type (for simple types)
+     * Used when returnType is explicitly specified in annotation
+     */
     public <T> T get(String key, Class<T> type) {
         if (key == null || key.trim().isEmpty()) {
             return null;
@@ -51,6 +56,37 @@ public class CacheManager {
         }
     }
     
+    /**
+     * Get cache with TypeReference (for generic types like List, Map, etc.)
+     * Used for auto-detect from method signature
+     */
+    public <T> T get(String key, TypeReference<T> typeRef) {
+        if (key == null || key.trim().isEmpty()) {
+            return null;
+        }
+        
+        try {
+            String fullKey = prefix + key;
+            RBucket<String> bucket = redissonClient.getBucket(fullKey);
+            
+            if (bucket.isExists()) {
+                String json = bucket.get();
+                T value = objectMapper.readValue(json, typeRef);
+                log.debug("Cache hit: {}", key);
+                return value;
+            }
+            
+            log.debug("Cache miss: {}", key);
+            return null;
+        } catch (Exception e) {
+            log.error("Failed to get cache: {}", key, e);
+            return null;
+        }
+    }
+    
+    /**
+     * Store object in cache
+     */
     public void put(String key, Object value, long ttlSeconds) {
         if (key == null || key.trim().isEmpty() || value == null) {
             return;
@@ -67,6 +103,9 @@ public class CacheManager {
         }
     }
     
+    /**
+     * Evict cache entry
+     */
     public void evict(String key) {
         if (key == null || key.trim().isEmpty()) {
             return;
@@ -81,6 +120,37 @@ public class CacheManager {
             }
         } catch (Exception e) {
             log.error("Failed to evict cache: {}", key, e);
+        }
+    }
+    
+    /**
+     * Clear all cache entries with given prefix
+     */
+    public void clear(String keyPrefix) {
+        try {
+            String pattern = prefix + keyPrefix + "*";
+            redissonClient.getKeys().deleteByPattern(pattern);
+            log.info("Cache cleared for pattern: {}", pattern);
+        } catch (Exception e) {
+            log.error("Failed to clear cache with prefix: {}", keyPrefix, e);
+        }
+    }
+    
+    /**
+     * Check if cache key exists
+     */
+    public boolean exists(String key) {
+        if (key == null || key.trim().isEmpty()) {
+            return false;
+        }
+        
+        try {
+            String fullKey = prefix + key;
+            RBucket<String> bucket = redissonClient.getBucket(fullKey);
+            return bucket.isExists();
+        } catch (Exception e) {
+            log.error("Failed to check cache existence: {}", key, e);
+            return false;
         }
     }
 }

@@ -19,16 +19,16 @@ public class DistributedLockServiceImpl implements DistributedLockService {
     private static final Logger log = LoggerFactory.getLogger(DistributedLockServiceImpl.class);
     
     private final LockManager lockManager;
-    private final IdempotencyManager idempotencyManager;
+    private final IdempotencyManager idempotencyManager;  // ✅ Can be null!
     private final DragonflyHealthIndicator healthIndicator;
     private final SaktiTxProperties properties;
     
     public DistributedLockServiceImpl(LockManager lockManager,
-                                     IdempotencyManager idempotencyManager,
+                                     IdempotencyManager idempotencyManager,  // ✅ Can be null!
                                      DragonflyHealthIndicator healthIndicator,
                                      SaktiTxProperties properties) {
         this.lockManager = lockManager;
-        this.idempotencyManager = idempotencyManager;
+        this.idempotencyManager = idempotencyManager;  // ✅ Can be null!
         this.healthIndicator = healthIndicator;
         this.properties = properties;
     }
@@ -75,6 +75,12 @@ public class DistributedLockServiceImpl implements DistributedLockService {
     @Override
     public <T> T executeWithLockAndIdempotency(String lockKey, String idempotencyKey,
                                               Supplier<T> action) throws Exception {
+        // ✅ Check if idempotency is available
+        if (idempotencyManager == null || !properties.getIdempotency().isEnabled()) {
+            log.warn("IdempotencyManager not available - executing with lock only");
+            return executeWithLock(lockKey, action);
+        }
+        
         if (!properties.getLock().isEnabled() || healthIndicator.isCircuitOpen()) {
             log.warn("Lock disabled or circuit open - executing without protection");
             return action.get();
@@ -122,7 +128,7 @@ public class DistributedLockServiceImpl implements DistributedLockService {
             
         } catch (Exception e) {
             log.error("Business logic failed: {}", lockKey, e);
-            if (idempotencyMarked) {
+            if (idempotencyMarked && idempotencyManager != null) {
                 idempotencyManager.rollback(idempotencyKey);
             }
             throw e;

@@ -1,4 +1,4 @@
-# SAKTI Transaction Coordinator v1.0.0
+# SAKTI Transaction Coordinator v1.0.2
 
 Distributed transaction management for SAKTI microservices.
 
@@ -9,7 +9,7 @@ Distributed transaction management for SAKTI microservices.
 <dependency>
     <groupId>id.go.kemenkeu.djpbn.sakti</groupId>
     <artifactId>sakti-tx-starter</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.2</version>
 </dependency>
 
 <!-- If using Dragonfly features -->

@@ -48,16 +48,22 @@ sakti.tx.circuit-breaker.failure-threshold=5
 sakti.tx.circuit-breaker.recovery-timeout-ms=30000
 
 # ===========================================================================
-# 6. JMS (OPTIONAL - reuse existing ConnectionFactory)
+# 6. JMS/ACTIVEMQ CONFIGURATION (OPTIONAL)
 # ===========================================================================
-sakti.tx.jms.enabled=false
-sakti.tx.jms.existing-factory-bean-name=artemisConnectionFactory
-sakti.tx.jms.default-ttl-ms=1800000
+sakti.tx.jms.enabled=true
 
-# If you want to create NEW connection (not recommended):
-#sakti.tx.jms.broker-url=tcp://artemis:61616
-#sakti.tx.jms.user=admin
-#sakti.tx.jms.password=admin
+# OPTION A: Reuse existing ConnectionFactory (RECOMMENDED if already exists)
+# Best for projects that already have Artemis configured
+sakti.tx.jms.existing-factory-bean-name=artemisConnectionFactory
+
+# OPTION B: Create new ConnectionFactory (For fresh projects without AMQ)
+# Use this if your project doesn't have Artemis config yet
+#sakti.tx.jms.broker-url=tcp://${AMQ_HOST:artemis-service}:61616
+#sakti.tx.jms.user=${AMQ_USER:admin}
+#sakti.tx.jms.password=${AMQ_PASSWORD:admin}
+#sakti.tx.jms.default-ttl-ms=1800000
+
+# NOTE: If both are configured, existing-factory-bean-name takes priority
 
 # ===========================================================================
 # 7. MULTI-DATABASE TRANSACTION (OPTIONAL)
@@ -275,7 +281,7 @@ In your project's `pom.xml`:
     <dependency>
         <groupId>id.go.kemenkeu.djpbn.sakti</groupId>
         <artifactId>sakti-tx-starter</artifactId>
-        <version>1.0.0</version>
+        <version>1.0.2</version>
     </dependency>
     
     <!-- ONLY if using Dragonfly features (lock, cache, idempotency) -->

@@ -17,6 +17,8 @@ import org.redisson.config.Config;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -41,8 +43,7 @@ public class SaktiTxAutoConfiguration {
     @ConditionalOnMissingBean(RedissonClient.class)
     @ConditionalOnProperty(prefix = "sakti.tx.dragonfly", name = "enabled", havingValue = "true")
     public RedissonClient redissonClient(SaktiTxProperties properties) {
-        log.info("Initializing Redisson client for Dragonfly: {}",
-                properties.getDragonfly().getUrl());
+        log.info("🚀 Initializing SAKTI RedissonClient: {}", properties.getDragonfly().getUrl());
 
         Config config = new Config();
         config.useSingleServer()
@@ -62,41 +63,29 @@ public class SaktiTxAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean(LockManager.class)
     @ConditionalOnProperty(prefix = "sakti.tx.lock", name = "enabled", havingValue = "true")
-    @ConditionalOnClass(name = "org.redisson.api.RedissonClient")
-    public LockManager lockManager(@Autowired(required = false) RedissonClient redissonClient) {
-        if (redissonClient == null) {
-            log.warn("RedissonClient not available - LockManager will not be created");
-            return null;
-        }
+    public LockManager lockManager(RedissonClient redissonClient) {
+        log.info("✅ Creating SAKTI LockManager");
         return new RedissonLockManager(redissonClient);
     }
 
     @Bean
     @ConditionalOnMissingBean(IdempotencyManager.class)
     @ConditionalOnProperty(prefix = "sakti.tx.idempotency", name = "enabled", havingValue = "true")
-    @ConditionalOnClass(name = "org.redisson.api.RedissonClient")
     public IdempotencyManager idempotencyManager(
-            @Autowired(required = false) RedissonClient redissonClient,
+            RedissonClient redissonClient,
             SaktiTxProperties properties) {
-        if (redissonClient == null) {
-            log.warn("RedissonClient not available - IdempotencyManager will not be created");
-            return null;
-        }
+        log.info("✅ Creating SAKTI IdempotencyManager");
         return new IdempotencyManager(redissonClient, properties.getIdempotency().getPrefix());
     }
 
-    @Bean
-    @ConditionalOnMissingBean(CacheManager.class)
+    @Bean("saktiCacheManager")
+    @ConditionalOnMissingBean(name = "saktiCacheManager")
     @ConditionalOnProperty(prefix = "sakti.tx.cache", name = "enabled", havingValue = "true")
-    @ConditionalOnClass(name = "org.redisson.api.RedissonClient")
-    public CacheManager cacheManager(
-            @Autowired(required = false) RedissonClient redissonClient,
+    public CacheManager saktiCacheManager(
+            RedissonClient redissonClient,
             ObjectMapper objectMapper,
             SaktiTxProperties properties) {
-        if (redissonClient == null) {
-            log.warn("RedissonClient not available - CacheManager will not be created");
-            return null;
-        }
+        log.info("✅ Creating SAKTI CacheManager");
         return new CacheManager(redissonClient, objectMapper, properties.getCache().getPrefix());
     }
 
@@ -105,81 +94,103 @@ public class SaktiTxAutoConfiguration {
     @ConditionalOnProperty(prefix = "sakti.tx.health", name = "enabled", havingValue = "true", matchIfMissing = true)
     @ConditionalOnClass(name = "org.springframework.boot.actuate.health.HealthIndicator")
     public DragonflyHealthIndicator dragonflyHealthIndicator(
-            @Autowired(required = false) RedissonClient redissonClient,
+            RedissonClient redissonClient,
             SaktiTxProperties properties) {
-        if (redissonClient == null) {
-            log.warn("RedissonClient not available - Health indicator will show disabled");
-        }
+        log.info("✅ Creating SAKTI Health Indicator");
         return new DragonflyHealthIndicator(redissonClient, properties);
     }
 
     @Bean
     @ConditionalOnMissingBean(JmsEventPublisher.class)
     @ConditionalOnProperty(prefix = "sakti.tx.jms", name = "enabled", havingValue = "true")
+    @ConditionalOnClass(name = "jakarta.jms.ConnectionFactory")
     public JmsEventPublisher jmsEventPublisher(
             ApplicationContext applicationContext,
             SaktiTxProperties properties) {
-
+        
         ConnectionFactory connectionFactory = null;
-
+        
         String existingBeanName = properties.getJms().getExistingFactoryBeanName();
         if (existingBeanName != null && !existingBeanName.trim().isEmpty()) {
             try {
                 connectionFactory = applicationContext.getBean(existingBeanName, ConnectionFactory.class);
-                log.info("Reusing existing ConnectionFactory: {}", existingBeanName);
+                log.info("✅ Reusing existing ConnectionFactory: {}", existingBeanName);
             } catch (Exception e) {
-                log.warn("Failed to find existing ConnectionFactory: {}", existingBeanName);
+                log.warn("⚠️ Bean not found: {}", existingBeanName);
             }
         }
-
+        
         if (connectionFactory == null) {
             try {
                 connectionFactory = applicationContext.getBean(ConnectionFactory.class);
-                log.info("Using default ConnectionFactory from context");
+                log.info("✅ Found default ConnectionFactory");
             } catch (Exception e) {
-                log.warn("No ConnectionFactory available - JMS publishing will be disabled");
+                log.debug("No default ConnectionFactory found");
+            }
+        }
+        
+        if (connectionFactory == null) {
+            String brokerUrl = properties.getJms().getBrokerUrl();
+            if (brokerUrl != null && !brokerUrl.trim().isEmpty()) {
+                try {
+                    Class<?> amqFactoryClass = Class.forName("org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory");
+                    connectionFactory = (ConnectionFactory) amqFactoryClass.getDeclaredConstructor(String.class)
+                        .newInstance(brokerUrl);
+                    
+                    if (properties.getJms().getUser() != null) {
+                        amqFactoryClass.getMethod("setUser", String.class)
+                            .invoke(connectionFactory, properties.getJms().getUser());
+                        amqFactoryClass.getMethod("setPassword", String.class)
+                            .invoke(connectionFactory, properties.getJms().getPassword());
+                    }
+                    
+                    log.info("✅ Created new ActiveMQConnectionFactory: {}", brokerUrl);
+                } catch (Exception e) {
+                    log.error("❌ Failed to create ActiveMQConnectionFactory", e);
+                    return null;
+                }
+            } else {
+                log.warn("❌ JMS enabled but no ConnectionFactory available");
                 return null;
             }
         }
+        
         return new JmsEventPublisher(connectionFactory, properties);
     }
 
     @Bean
     @ConditionalOnMissingBean(SaktiLockAspect.class)
     @ConditionalOnProperty(prefix = "sakti.tx.lock", name = "enabled", havingValue = "true")
+    @ConditionalOnBean(LockManager.class)
     public SaktiLockAspect saktiLockAspect(
-            @Autowired(required = false) LockManager lockManager,
+            LockManager lockManager,
             SaktiTxProperties properties,
             DragonflyHealthIndicator healthIndicator) {
-        if (lockManager == null) {
-            log.warn("LockManager not available - @SaktiLock will be no-op");
-        }
+        log.info("✅ Creating SAKTI Lock Aspect");
         return new SaktiLockAspect(lockManager, properties, healthIndicator);
     }
 
     @Bean
     @ConditionalOnMissingBean(SaktiCacheAspect.class)
     @ConditionalOnProperty(prefix = "sakti.tx.cache", name = "enabled", havingValue = "true")
+    @ConditionalOnBean(name = "saktiCacheManager")
     public SaktiCacheAspect saktiCacheAspect(
-            @Autowired(required = false) CacheManager cacheManager,
+            CacheManager saktiCacheManager,
             SaktiTxProperties properties,
             DragonflyHealthIndicator healthIndicator) {
-        if (cacheManager == null) {
-            log.warn("CacheManager not available - @SaktiCache will be no-op");
-        }
-        return new SaktiCacheAspect(cacheManager, properties, healthIndicator);
+        log.info("✅ Creating SAKTI Cache Aspect");
+        return new SaktiCacheAspect(saktiCacheManager, properties, healthIndicator);
     }
 
     @Bean
     @ConditionalOnMissingBean(SaktiIdempotentAspect.class)
     @ConditionalOnProperty(prefix = "sakti.tx.idempotency", name = "enabled", havingValue = "true")
+    @ConditionalOnBean(IdempotencyManager.class)
     public SaktiIdempotentAspect saktiIdempotentAspect(
-            @Autowired(required = false) IdempotencyManager idempotencyManager,
+            IdempotencyManager idempotencyManager,
             SaktiTxProperties properties,
             DragonflyHealthIndicator healthIndicator) {
-        if (idempotencyManager == null) {
-            log.warn("IdempotencyManager not available - @SaktiIdempotent will be no-op");
-        }
+        log.info("✅ Creating SAKTI Idempotent Aspect");
         return new SaktiIdempotentAspect(idempotencyManager, properties, healthIndicator);
     }
 
@@ -187,20 +198,26 @@ public class SaktiTxAutoConfiguration {
     @ConditionalOnMissingBean(SaktiDistributedTxAspect.class)
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
     public SaktiDistributedTxAspect saktiDistributedTxAspect(SaktiTxProperties properties) {
+        log.info("✅ Creating SAKTI Distributed TX Aspect");
         return new SaktiDistributedTxAspect(properties);
     }
 
     @Bean
     @ConditionalOnMissingBean(DistributedLockService.class)
     @ConditionalOnProperty(prefix = "sakti.tx.lock", name = "enabled", havingValue = "true")
+    @ConditionalOnBean(LockManager.class)
     public DistributedLockService distributedLockService(
-            @Autowired(required = false) LockManager lockManager,
-            @Autowired(required = false) IdempotencyManager idempotencyManager,
+            LockManager lockManager,
+            IdempotencyManager idempotencyManager,  // ✅ OPTIONAL!
             DragonflyHealthIndicator healthIndicator,
             SaktiTxProperties properties) {
-        if (lockManager == null || idempotencyManager == null) {
-            log.warn("LockManager or IdempotencyManager not available - DistributedLockService will be limited");
+        
+        if (idempotencyManager == null) {
+            log.warn("⚠️ DistributedLockService created without IdempotencyManager - executeWithLockAndIdempotency() will use lock-only mode");
+        } else {
+            log.info("✅ Creating SAKTI DistributedLockService with full features");
         }
+        
         return new DistributedLockServiceImpl(lockManager, idempotencyManager, healthIndicator, properties);
-}
+    }
 }
