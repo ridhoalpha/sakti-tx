@@ -4,11 +4,11 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import id.go.kemenkeu.djpbn.sakti.tx.core.cache.CacheManager;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.annotation.SaktiCache;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.config.SaktiTxProperties;
-import id.go.kemenkeu.djpbn.sakti.tx.starter.health.DragonflyHealthIndicator;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
 import org.aspectj.lang.reflect.MethodSignature;
+import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.expression.ExpressionParser;
@@ -27,21 +27,21 @@ public class SaktiCacheAspect {
     
     private final CacheManager saktiCacheManager;
     private final SaktiTxProperties properties;
-    private final DragonflyHealthIndicator healthIndicator;
+    private final RedissonClient redissonClient;
     private final ExpressionParser parser = new SpelExpressionParser();
     
     public SaktiCacheAspect(CacheManager saktiCacheManager,
                            SaktiTxProperties properties,
-                           DragonflyHealthIndicator healthIndicator) {
+                           RedissonClient redissonClient) {
         this.saktiCacheManager = saktiCacheManager;
         this.properties = properties;
-        this.healthIndicator = healthIndicator;
+        this.redissonClient = redissonClient;
     }
     
     @Around("@annotation(id.go.kemenkeu.djpbn.sakti.tx.starter.annotation.SaktiCache)")
     public Object around(ProceedingJoinPoint pjp) throws Throwable {
-        if (!properties.getCache().isEnabled() || healthIndicator.isCircuitOpen()) {
-            log.debug("Cache disabled or circuit open - executing without cache");
+        if (!properties.getCache().isEnabled() || !isRedisHealthy()) {
+            log.debug("Cache disabled or Redis unhealthy - executing without cache");
             return pjp.proceed();
         }
         
@@ -56,11 +56,9 @@ public class SaktiCacheAspect {
         Object cached = null;
         
         if (annotation.returnType() != Object.class) {
-            // Explicit returnType (for simple types or backward compatibility)
             log.debug("Using explicit returnType: {}", annotation.returnType().getSimpleName());
             cached = saktiCacheManager.get(cacheKey, annotation.returnType());
         } else {
-            // Auto-detect from method signature (for generic types)
             log.debug("Auto-detecting return type from method signature");
             Type genericReturnType = method.getGenericReturnType();
             TypeReference<Object> typeRef = new TypeReference<Object>() {
@@ -87,6 +85,19 @@ public class SaktiCacheAspect {
         }
         
         return result;
+    }
+    
+    private boolean isRedisHealthy() {
+        if (redissonClient == null) {
+            return false;
+        }
+        
+        try {
+            return redissonClient.getNodesGroup().pingAll();
+        } catch (Exception e) {
+            log.warn("Redis health check failed: {}", e.getMessage());
+            return false;
+        }
     }
     
     private StandardEvaluationContext createSpelContext(ProceedingJoinPoint pjp) {

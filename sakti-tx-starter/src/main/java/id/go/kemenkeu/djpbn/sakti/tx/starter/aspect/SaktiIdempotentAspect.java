@@ -4,11 +4,11 @@ import id.go.kemenkeu.djpbn.sakti.tx.core.idempotency.IdempotencyManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.exception.IdempotencyException;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.annotation.SaktiIdempotent;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.config.SaktiTxProperties;
-import id.go.kemenkeu.djpbn.sakti.tx.starter.health.DragonflyHealthIndicator;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
 import org.aspectj.lang.reflect.MethodSignature;
+import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.expression.ExpressionParser;
@@ -26,21 +26,22 @@ public class SaktiIdempotentAspect {
     
     private final IdempotencyManager idempotencyManager;
     private final SaktiTxProperties properties;
-    private final DragonflyHealthIndicator healthIndicator;
+    private final RedissonClient redissonClient;
     private final ExpressionParser parser = new SpelExpressionParser();
     
     public SaktiIdempotentAspect(IdempotencyManager idempotencyManager,
                                 SaktiTxProperties properties,
-                                DragonflyHealthIndicator healthIndicator) {
+                                RedissonClient redissonClient) {
         this.idempotencyManager = idempotencyManager;
         this.properties = properties;
-        this.healthIndicator = healthIndicator;
+        this.redissonClient = redissonClient;
+        log.debug("SaktiIdempotentAspect initialized successfully");
     }
     
     @Around("@annotation(id.go.kemenkeu.djpbn.sakti.tx.starter.annotation.SaktiIdempotent)")
     public Object around(ProceedingJoinPoint pjp) throws Throwable {
-        if (!properties.getIdempotency().isEnabled() || healthIndicator.isCircuitOpen()) {
-            log.debug("Idempotency disabled or circuit open - executing without check");
+        if (!properties.getIdempotency().isEnabled() || !isRedisHealthy()) {
+            log.debug("Idempotency disabled or Redis unhealthy - executing without check");
             return pjp.proceed();
         }
         
@@ -73,6 +74,19 @@ public class SaktiIdempotentAspect {
         } catch (Exception e) {
             idempotencyManager.rollback(idempKey);
             throw e;
+        }
+    }
+    
+    private boolean isRedisHealthy() {
+        if (redissonClient == null) {
+            return false;
+        }
+        
+        try {
+            return redissonClient.getNodesGroup().pingAll();
+        } catch (Exception e) {
+            log.warn("Redis health check failed: {}", e.getMessage());
+            return false;
         }
     }
     

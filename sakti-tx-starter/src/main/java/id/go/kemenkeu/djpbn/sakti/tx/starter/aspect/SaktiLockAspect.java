@@ -4,11 +4,11 @@ import id.go.kemenkeu.djpbn.sakti.tx.core.lock.LockManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.exception.LockAcquisitionException;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.annotation.SaktiLock;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.config.SaktiTxProperties;
-import id.go.kemenkeu.djpbn.sakti.tx.starter.health.DragonflyHealthIndicator;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
 import org.aspectj.lang.reflect.MethodSignature;
+import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.expression.ExpressionParser;
@@ -26,21 +26,26 @@ public class SaktiLockAspect {
     
     private final LockManager lockManager;
     private final SaktiTxProperties properties;
-    private final DragonflyHealthIndicator healthIndicator;
+    private final RedissonClient redissonClient;
     private final ExpressionParser parser = new SpelExpressionParser();
     
     public SaktiLockAspect(LockManager lockManager,
                           SaktiTxProperties properties,
-                          DragonflyHealthIndicator healthIndicator) {
+                          RedissonClient redissonClient) {
         this.lockManager = lockManager;
         this.properties = properties;
-        this.healthIndicator = healthIndicator;
+        this.redissonClient = redissonClient;
     }
     
     @Around("@annotation(id.go.kemenkeu.djpbn.sakti.tx.starter.annotation.SaktiLock)")
     public Object around(ProceedingJoinPoint pjp) throws Throwable {
-        if (!properties.getLock().isEnabled() || healthIndicator.isCircuitOpen()) {
-            log.warn("Lock disabled or circuit open - executing without lock");
+        if (!properties.getLock().isEnabled()) {
+            log.debug("Lock disabled in properties - executing without lock");
+            return pjp.proceed();
+        }
+
+        if (!isRedisHealthy()) {
+            log.warn("Redis unhealthy - executing without lock (graceful degradation)");
             return pjp.proceed();
         }
         
@@ -74,6 +79,20 @@ public class SaktiLockAspect {
             if (lock != null) {
                 lock.release();
             }
+        }
+    }
+    
+    private boolean isRedisHealthy() {
+        if (redissonClient == null) {
+            return false;
+        }
+        
+        try {
+            // Simple ping - fast operation
+            return redissonClient.getNodesGroup().pingAll();
+        } catch (Exception e) {
+            log.warn("Redis health check failed: {}", e.getMessage());
+            return false;
         }
     }
     
