@@ -134,6 +134,8 @@ public class SaktiTxProperties {
         private long defaultTtlMs = 1800000;
         private String existingFactoryBeanName = "";
         
+        private boolean testOnStartup = true;
+        
         public boolean isEnabled() { return enabled; }
         public void setEnabled(boolean enabled) { this.enabled = enabled; }
         
@@ -153,6 +155,9 @@ public class SaktiTxProperties {
         public void setExistingFactoryBeanName(String existingFactoryBeanName) { 
             this.existingFactoryBeanName = existingFactoryBeanName; 
         }
+        
+        public boolean isTestOnStartup() { return testOnStartup; }
+        public void setTestOnStartup(boolean testOnStartup) { this.testOnStartup = testOnStartup; }
     }
     
     public static class MultiDb {

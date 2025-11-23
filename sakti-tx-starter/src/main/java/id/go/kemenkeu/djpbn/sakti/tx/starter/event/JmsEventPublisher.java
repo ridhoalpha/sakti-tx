@@ -11,19 +11,44 @@ import java.util.Map;
 /**
  * JMS Event Publisher for publishing messages to ActiveMQ Artemis
  * Supports both Queue and Topic messaging patterns
+ * 
+ * ✅ FIXED: Constructor accepts Object type to avoid ClassNotFoundException at startup
  */
 public class JmsEventPublisher {
     
     private static final Logger log = LoggerFactory.getLogger(JmsEventPublisher.class);
     
+    private final Object connectionFactoryObject;
     private final ConnectionFactory connectionFactory;
     private final long defaultTtlMs;
     private final boolean enabled;
     
-    public JmsEventPublisher(ConnectionFactory connectionFactory, SaktiTxProperties properties) {
-        this.connectionFactory = connectionFactory;
+    /**
+     * Constructor with safe type handling
+     * 
+     * @param connectionFactory ConnectionFactory object (passed as Object to avoid class loading issues)
+     * @param properties Configuration properties
+     */
+    public JmsEventPublisher(Object connectionFactory, SaktiTxProperties properties) {
+        this.connectionFactoryObject = connectionFactory;
+        
+        // Safe cast - we know it's a ConnectionFactory because we checked in auto-config
+        if (connectionFactory instanceof ConnectionFactory) {
+            this.connectionFactory = (ConnectionFactory) connectionFactory;
+        } else {
+            log.error("❌ Invalid ConnectionFactory type: {}", 
+                connectionFactory != null ? connectionFactory.getClass().getName() : "null");
+            this.connectionFactory = null;
+        }
+        
         this.defaultTtlMs = properties.getJms().getDefaultTtlMs();
         this.enabled = properties.getJms().isEnabled();
+        
+        if (this.connectionFactory == null) {
+            log.error("❌ JmsEventPublisher created but ConnectionFactory is null - operations will fail");
+        } else {
+            log.info("✅ JmsEventPublisher initialized successfully");
+        }
     }
     
     /**
@@ -54,6 +79,11 @@ public class JmsEventPublisher {
                            long ttlMs, Map<String, Object> properties) {
         if (!enabled) {
             log.debug("JMS disabled - message not sent to queue: {}", queueName);
+            return;
+        }
+        
+        if (connectionFactory == null) {
+            log.error("ConnectionFactory is null - cannot send message to queue: {}", queueName);
             return;
         }
         
@@ -124,6 +154,11 @@ public class JmsEventPublisher {
             return;
         }
         
+        if (connectionFactory == null) {
+            log.error("ConnectionFactory is null - cannot send message to topic: {}", topicName);
+            return;
+        }
+        
         Connection connection = null;
         Session session = null;
         MessageProducer producer = null;
@@ -169,6 +204,11 @@ public class JmsEventPublisher {
                                 String correlationId) {
         if (!enabled) {
             log.debug("JMS disabled - message not sent");
+            return;
+        }
+        
+        if (connectionFactory == null) {
+            log.error("ConnectionFactory is null - cannot send message");
             return;
         }
         
@@ -236,7 +276,7 @@ public class JmsEventPublisher {
      * Check if JMS is enabled
      */
     public boolean isEnabled() {
-        return enabled;
+        return enabled && connectionFactory != null;
     }
     
     /**

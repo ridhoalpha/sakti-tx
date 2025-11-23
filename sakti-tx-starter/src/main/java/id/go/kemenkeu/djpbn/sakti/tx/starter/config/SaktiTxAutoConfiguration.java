@@ -268,7 +268,7 @@ public class SaktiTxAutoConfiguration {
         log.info("Creating DistributedLockService");
         return new DistributedLockServiceImpl(lockManager, idempotencyManager, healthIndicator, properties);
     }
-
+    
     @Bean
     @ConditionalOnMissingBean(JmsEventPublisher.class)
     @ConditionalOnProperty(prefix = "sakti.tx.jms", name = "enabled", havingValue = "true")
@@ -277,57 +277,175 @@ public class SaktiTxAutoConfiguration {
             ApplicationContext applicationContext,
             SaktiTxProperties properties) {
         
-        ConnectionFactory connectionFactory = null;
+        log.info("Initializing JMS Event Publisher...");
         
-        String existingBeanName = properties.getJms().getExistingFactoryBeanName();
-        if (existingBeanName != null && !existingBeanName.trim().isEmpty()) {
+        Object connectionFactory = null;
+        String factorySource = null;
+        
+        try {
+            Class<?> connectionFactoryClass;
             try {
-                connectionFactory = applicationContext.getBean(existingBeanName, ConnectionFactory.class);
-                log.info("JmsEventPublisher using existing ConnectionFactory: {}", existingBeanName);
-            } catch (Exception e) {
-                log.warn("Cannot find ConnectionFactory bean: {}", existingBeanName);
-            }
-        }
-        
-        if (connectionFactory == null) {
-            try {
-                connectionFactory = applicationContext.getBean(ConnectionFactory.class);
-                log.info("JmsEventPublisher using default ConnectionFactory");
-            } catch (Exception e) {
-                log.debug("No default ConnectionFactory found");
-            }
-        }
-        
-        if (connectionFactory == null) {
-            String brokerUrl = properties.getJms().getBrokerUrl();
-            if (brokerUrl != null && !brokerUrl.trim().isEmpty()) {
-                try {
-                    Class<?> amqFactoryClass = Class.forName("org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory");
-                    connectionFactory = (ConnectionFactory) amqFactoryClass.getDeclaredConstructor(String.class)
-                        .newInstance(brokerUrl);
-                    
-                    if (properties.getJms().getUser() != null && !properties.getJms().getUser().isEmpty()) {
-                        amqFactoryClass.getMethod("setUser", String.class)
-                            .invoke(connectionFactory, properties.getJms().getUser());
-                        amqFactoryClass.getMethod("setPassword", String.class)
-                            .invoke(connectionFactory, properties.getJms().getPassword());
-                    }
-                    
-                    log.info("JmsEventPublisher created new ActiveMQConnectionFactory: {}", brokerUrl);
-                } catch (Exception e) {
-                    log.error("Failed to create ActiveMQConnectionFactory: {}", e.getMessage());
-                    log.error("   → Solution: Add artemis-jakarta-client dependency OR disable JMS (sakti.tx.jms.enabled=false)");
-                    return null;
-                }
-            } else {
-                log.error("JMS enabled but no ConnectionFactory available");
-                log.error("   → Solution 1: Set sakti.tx.jms.existing-factory-bean-name=yourBeanName");
-                log.error("   → Solution 2: Set sakti.tx.jms.broker-url=tcp://host:port");
-                log.error("   → Solution 3: Disable JMS (sakti.tx.jms.enabled=false)");
+                connectionFactoryClass = Class.forName("jakarta.jms.ConnectionFactory");
+            } catch (ClassNotFoundException e) {
+                log.error("jakarta.jms.ConnectionFactory not found - this should not happen due to @ConditionalOnClass");
                 return null;
             }
+
+            String existingBeanName = properties.getJms().getExistingFactoryBeanName();
+            if (existingBeanName != null && !existingBeanName.trim().isEmpty()) {
+                try {
+                    connectionFactory = applicationContext.getBean(existingBeanName, connectionFactoryClass);
+                    factorySource = "existing bean: " + existingBeanName;
+                    log.info("Found existing ConnectionFactory: {}", existingBeanName);
+                } catch (Exception e) {
+                    log.warn("Cannot find ConnectionFactory bean: {} - {}", existingBeanName, e.getMessage());
+                }
+            }
+            
+            // ═════════════════════════════════════════════════════════════════
+            // STEP 3: Try to get default ConnectionFactory bean
+            // ═════════════════════════════════════════════════════════════════
+            if (connectionFactory == null) {
+                try {
+                    connectionFactory = applicationContext.getBean(connectionFactoryClass);
+                    factorySource = "default bean";
+                    log.info("Found default ConnectionFactory");
+                } catch (Exception e) {
+                    log.debug("No default ConnectionFactory found");
+                }
+            }
+            
+            // ═════════════════════════════════════════════════════════════════
+            // STEP 4: Try to create new ActiveMQ ConnectionFactory
+            // ═════════════════════════════════════════════════════════════════
+            if (connectionFactory == null) {
+                String brokerUrl = properties.getJms().getBrokerUrl();
+                
+                if (brokerUrl == null || brokerUrl.trim().isEmpty()) {
+                    log.error("JMS Configuration Error:");
+                    log.error("   → sakti.tx.jms.enabled=true but no ConnectionFactory available");
+                    log.error("   → Solutions:");
+                    log.error("      1. Set sakti.tx.jms.existing-factory-bean-name=yourBeanName");
+                    log.error("      2. Set sakti.tx.jms.broker-url=tcp://host:port");
+                    log.error("      3. Create your own ConnectionFactory bean");
+                    log.error("      4. Disable JMS: sakti.tx.jms.enabled=false");
+                    return null;
+                }
+                
+                // Try to create ActiveMQ ConnectionFactory
+                try {
+                    log.debug("Attempting to create ActiveMQConnectionFactory for: {}", brokerUrl);
+                    
+                    // Check if artemis-jakarta-client is in classpath
+                    Class<?> amqFactoryClass;
+                    try {
+                        amqFactoryClass = Class.forName("org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory");
+                    } catch (ClassNotFoundException e) {
+                        log.error("ActiveMQ Artemis client not found in classpath");
+                        log.error("   → Add dependency:");
+                        log.error("      <dependency>");
+                        log.error("        <groupId>org.apache.activemq</groupId>");
+                        log.error("        <artifactId>artemis-jakarta-client</artifactId>");
+                        log.error("        <version>2.38.0</version>");
+                        log.error("      </dependency>");
+                        log.error("   → Or disable JMS: sakti.tx.jms.enabled=false");
+                        return null;
+                    }
+                    
+                    // Create factory instance
+                    connectionFactory = amqFactoryClass
+                        .getDeclaredConstructor(String.class)
+                        .newInstance(brokerUrl);
+                    
+                    // Set credentials if provided
+                    String user = properties.getJms().getUser();
+                    String password = properties.getJms().getPassword();
+                    
+                    if (user != null && !user.trim().isEmpty()) {
+                        amqFactoryClass.getMethod("setUser", String.class)
+                            .invoke(connectionFactory, user);
+                        amqFactoryClass.getMethod("setPassword", String.class)
+                            .invoke(connectionFactory, password);
+                        log.debug("Set JMS credentials: user={}", user);
+                    }
+                    
+                    factorySource = "new ActiveMQConnectionFactory: " + brokerUrl;
+                    log.info("Created new ActiveMQConnectionFactory: {}", brokerUrl);
+                    
+                } catch (Exception e) {
+                    log.error("Failed to create ActiveMQConnectionFactory: {}", e.getMessage());
+                    log.error("   → Check broker URL: {}", brokerUrl);
+                    log.error("   → Verify artemis-jakarta-client dependency");
+                    return null;
+                }
+            }
+            
+            // ═════════════════════════════════════════════════════════════════
+            // STEP 5: Test connection (optional but recommended)
+            // ═════════════════════════════════════════════════════════════════
+            if (properties.getJms().isTestOnStartup()) {
+                if (!testJmsConnection(connectionFactory, factorySource)) {
+                    log.warn("JMS connection test failed - bean will still be created");
+                    log.warn("   → JMS operations may fail at runtime");
+                    log.warn("   → Set sakti.tx.jms.test-on-startup=false to skip this test");
+                }
+            }
+            
+            // ═════════════════════════════════════════════════════════════════
+            // STEP 6: Create JmsEventPublisher bean
+            // ═════════════════════════════════════════════════════════════════
+            log.info("Creating JmsEventPublisher (source: {})", factorySource);
+            
+            // Cast to jakarta.jms.ConnectionFactory (safe because we checked the class)
+            return new JmsEventPublisher(connectionFactory, properties);
+            
+        } catch (Exception e) {
+            log.error("Unexpected error during JMS initialization: {}", e.getMessage(), e);
+            log.error("   → Disable JMS if not needed: sakti.tx.jms.enabled=false");
+            return null;
+        }
+    }
+    
+    /**
+     * Test JMS connection
+     * Uses reflection to avoid direct JMS type references
+     * Non-blocking, returns quickly
+     * Closes resources properly
+     */
+    private boolean testJmsConnection(Object connectionFactory, String source) {
+        if (connectionFactory == null) {
+            return false;
         }
         
-        return new JmsEventPublisher(connectionFactory, properties);
+        Object connection = null;
+        try {
+            log.debug("Testing JMS connection: {}", source);
+            
+            // Use reflection: connection = connectionFactory.createConnection()
+            Class<?> factoryClass = connectionFactory.getClass();
+            Object connectionObj = factoryClass.getMethod("createConnection").invoke(connectionFactory);
+            connection = connectionObj;
+            
+            // Use reflection: connection.start()
+            connectionObj.getClass().getMethod("start").invoke(connectionObj);
+            
+            log.info("JMS connection test successful: {}", source);
+            return true;
+            
+        } catch (Exception e) {
+            log.error("JMS connection test failed: {} - {}", source, e.getMessage());
+            log.error("   → Verify ActiveMQ/Artemis is running and accessible");
+            return false;
+            
+        } finally {
+            if (connection != null) {
+                try {
+                    // Use reflection: connection.close()
+                    connection.getClass().getMethod("close").invoke(connection);
+                } catch (Exception e) {
+                    log.debug("Error closing test connection: {}", e.getMessage());
+                }
+            }
+        }
     }
 }

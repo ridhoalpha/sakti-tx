@@ -29,6 +29,7 @@
         <spring.boot.version>3.5.7</spring.boot.version>
         <redisson.version>3.41.0</redisson.version>
         <artemis.version>2.38.0</artemis.version>
+        <jms.version>3.1.0</jms.version>
         <jackson.version>2.18.2</jackson.version>
         <slf4j.version>2.0.16</slf4j.version>
         <lombok.version>1.18.38</lombok.version>
@@ -63,6 +64,13 @@
                 <groupId>org.apache.activemq</groupId>
                 <artifactId>artemis-jakarta-client</artifactId>
                 <version>${artemis.version}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>jakarta.jms</groupId>
+                <artifactId>jakarta.jms-api</artifactId>
+                <version>${jms.version}</version>
+                <optional>true</optional>
             </dependency>
             
             <!-- Jackson -->
