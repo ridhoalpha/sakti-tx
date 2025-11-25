@@ -368,9 +368,15 @@ public class CompensatingTransactionExecutor {
         EntityManager em = entityManagers.get(datasource);
         
         if (em == null) {
+            String available = String.join(", ", entityManagers.keySet());
             throw new IllegalStateException(
-                "No EntityManager found for datasource: " + datasource + 
-                ". Available: " + entityManagers.keySet());
+                String.format(
+                    "No EntityManager found for datasource '%s'. Available datasources: [%s]. " +
+                    "Ensure your EntityManager beans are properly configured with names matching " +
+                    "the datasource identifiers (e.g., 'db1EntityManager', 'db2EntityManager').",
+                    datasource, available
+                )
+            );
         }
         
         return em;

@@ -4,13 +4,14 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import id.go.kemenkeu.djpbn.sakti.tx.core.cache.CacheManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.compensate.CompensatingTransactionExecutor;
 import id.go.kemenkeu.djpbn.sakti.tx.core.idempotency.IdempotencyManager;
+import id.go.kemenkeu.djpbn.sakti.tx.core.listener.EntityOperationListener;
 import id.go.kemenkeu.djpbn.sakti.tx.core.lock.LockManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.lock.RedissonLockManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.log.TransactionLogManager;
+import id.go.kemenkeu.djpbn.sakti.tx.core.mapper.EntityManagerDatasourceMapper;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.aspect.*;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.event.JmsEventPublisher;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.health.DragonflyHealthIndicator;
-import id.go.kemenkeu.djpbn.sakti.tx.starter.interceptor.RepositoryOperationInterceptor;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.interceptor.ServiceOperationInterceptor;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.service.DistributedLockService;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.service.impl.DistributedLockServiceImpl;
@@ -29,6 +30,7 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.persistence.EntityManager;
@@ -53,6 +55,11 @@ public class SaktiTxAutoConfiguration {
         log.info("═══════════════════════════════════════════════════════════");
         
         boolean hasErrors = false;
+
+        if (properties.getMultiDb().isEnabled()) {
+            log.info("Setting up automatic entity tracking with JPA listeners");
+            EntityOperationListener.setObjectMapper(objectMapper());
+        }
         
         // Validate Dragonfly-dependent features
         if (!properties.getDragonfly().isEnabled()) {
@@ -280,13 +287,73 @@ public class SaktiTxAutoConfiguration {
     }
     
     @Bean
+    @ConditionalOnMissingBean(EntityManagerDatasourceMapper.class)
+    public EntityManagerDatasourceMapper entityManagerDatasourceMapper(ApplicationContext ctx) {
+        log.info("Creating EntityManagerDatasourceMapper");
+        
+        EntityManagerDatasourceMapper mapper = new EntityManagerDatasourceMapper();
+        
+        // Auto-register all EntityManager beans
+        Map<String, EntityManager> emBeans = ctx.getBeansOfType(EntityManager.class);
+        for (Map.Entry<String, EntityManager> entry : emBeans.entrySet()) {
+            String beanName = entry.getKey();
+            EntityManager em = entry.getValue();
+            
+            // Extract datasource name from bean name
+            String datasourceName = extractDatasourceName(beanName);
+            mapper.registerEntityManager(datasourceName, em);
+            
+            log.info("Auto-registered EntityManager: {} -> {}", datasourceName, beanName);
+        }
+        
+        // Also check EntityManagerFactory beans for better detection
+        Map<String, LocalContainerEntityManagerFactoryBean> emfBeans = 
+            ctx.getBeansOfType(LocalContainerEntityManagerFactoryBean.class);
+        
+        for (Map.Entry<String, LocalContainerEntityManagerFactoryBean> entry : emfBeans.entrySet()) {
+            try {
+                String beanName = entry.getKey();
+                EntityManager em = entry.getValue().getObject().createEntityManager();
+                String datasourceName = extractDatasourceName(beanName);
+                
+                // Only register if not already registered
+                if (mapper.getAllEntityManagers().get(datasourceName) == null) {
+                    mapper.registerEntityManager(datasourceName, em);
+                    log.info("Auto-registered EntityManager from factory: {} -> {}", 
+                        datasourceName, beanName);
+                }
+            } catch (Exception e) {
+                log.warn("Could not create EntityManager from factory: {}", entry.getKey());
+            }
+        }
+        
+        return mapper;
+    }
+    
+    private String extractDatasourceName(String beanName) {
+        String lower = beanName.toLowerCase();
+        
+        if (lower.contains("db1") || lower.contains("primary") || lower.contains("first")) {
+            return "db1";
+        } else if (lower.contains("db2") || lower.contains("secondary") || lower.contains("second")) {
+            return "db2";
+        } else if (lower.contains("db3") || lower.contains("third")) {
+            return "db3";
+        } else if (lower.contains("entitymanager")) {
+            return "default";
+        }
+        
+        return beanName;
+    }
+    
+    @Bean
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
     public CompensatingTransactionExecutor compensatingTransactionExecutor(
-            ApplicationContext applicationContext,
+            EntityManagerDatasourceMapper mapper,
             ObjectMapper objectMapper) {
         log.info("Creating CompensatingTransactionExecutor");
         
-        Map<String, EntityManager> entityManagers = applicationContext.getBeansOfType(EntityManager.class);
+        Map<String, EntityManager> entityManagers = mapper.getAllEntityManagers();
         
         if (entityManagers.isEmpty()) {
             log.warn("No EntityManager beans found - compensating transactions may fail");
@@ -312,16 +379,10 @@ public class SaktiTxAutoConfiguration {
             SaktiTxProperties properties,
             TransactionLogManager logManager,
             CompensatingTransactionExecutor compensator,
+            EntityManagerDatasourceMapper emMapper,
             @Autowired(required = false) LockManager lockManager) {
         log.info("Creating SaktiDistributedTxAspect");
-        return new SaktiDistributedTxAspect(properties, logManager, compensator, lockManager);
-    }
-    
-    @Bean
-    @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
-    public RepositoryOperationInterceptor repositoryOperationInterceptor() {
-        log.info("Creating RepositoryOperationInterceptor (auto-tracking)");
-        return new RepositoryOperationInterceptor();
+        return new SaktiDistributedTxAspect(properties, logManager, compensator, emMapper, lockManager);
     }
 
     /**

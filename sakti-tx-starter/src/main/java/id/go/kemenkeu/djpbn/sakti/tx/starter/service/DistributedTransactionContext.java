@@ -4,6 +4,9 @@ import id.go.kemenkeu.djpbn.sakti.tx.core.log.TransactionLog;
 import id.go.kemenkeu.djpbn.sakti.tx.core.log.TransactionLog.OperationType;
 import id.go.kemenkeu.djpbn.sakti.tx.core.log.TransactionLogManager;
 
+import java.util.List;
+import java.util.Map;
+
 /**
  * Thread-local context untuk distributed transaction
  * Holds current transaction log and state
@@ -56,9 +59,10 @@ public class DistributedTransactionContext {
         return ctx != null && ctx.active;
     }
     
-    /**
-     * Record operation to transaction log
-     */
+    // ========================================================================
+    // Simple Entity Operations (used internally by EntityOperationListener)
+    // ========================================================================
+    
     public void recordOperation(String datasource, OperationType type, 
                                  String entityClass, Object entityId, 
                                  Object snapshot) {
@@ -67,14 +71,76 @@ public class DistributedTransactionContext {
         }
         
         txLog.recordOperation(datasource, type, entityClass, entityId, snapshot);
+        logManager.saveLog(txLog);
+    }
+    
+    // ========================================================================
+    // Complex Operations (used by @TrackOperation methods)
+    // ========================================================================
+    
+    /**
+     * Record bulk operation (BULK_UPDATE, BULK_DELETE)
+     * 
+     * Developer MUST call this BEFORE executing bulk operation
+     * to capture snapshots of affected entities
+     */
+    public void recordBulkOperation(String datasource, 
+                                     OperationType type,
+                                     String entityClass, 
+                                     List<Map<String, Object>> affectedEntities,
+                                     String queryInfo) {
+        if (!active) {
+            throw new IllegalStateException("Transaction context is not active");
+        }
         
-        // Save to Redis after each operation (for durability)
+        txLog.recordBulkOperation(datasource, type, entityClass, affectedEntities, queryInfo);
         logManager.saveLog(txLog);
     }
     
     /**
-     * Mark transaction as rollback only
+     * Record native query with inverse query
+     * 
+     * Developer MUST provide inverse query for rollback
      */
+    public void recordNativeQuery(String datasource,
+                                   String entityClass,
+                                   Object entityId,
+                                   Object snapshot,
+                                   String originalQuery,
+                                   String inverseQuery,
+                                   Map<String, Object> queryParameters) {
+        if (!active) {
+            throw new IllegalStateException("Transaction context is not active");
+        }
+        
+        txLog.recordNativeQuery(datasource, entityClass, entityId, snapshot, 
+            originalQuery, inverseQuery, queryParameters);
+        logManager.saveLog(txLog);
+    }
+    
+    /**
+     * Record stored procedure call
+     * 
+     * Developer MUST provide inverse procedure or affected entities snapshot
+     */
+    public void recordStoredProcedure(String datasource,
+                                       String procedureName,
+                                       String inverseProcedure,
+                                       Map<String, Object> parameters,
+                                       List<Map<String, Object>> affectedEntities) {
+        if (!active) {
+            throw new IllegalStateException("Transaction context is not active");
+        }
+        
+        txLog.recordStoredProcedure(datasource, procedureName, inverseProcedure, 
+            parameters, affectedEntities);
+        logManager.saveLog(txLog);
+    }
+    
+    // ========================================================================
+    // Transaction State Management
+    // ========================================================================
+    
     public void setRollbackOnly() {
         this.rollbackOnly = true;
     }

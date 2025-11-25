@@ -7,21 +7,22 @@ import id.go.kemenkeu.djpbn.sakti.tx.starter.service.DistributedTransactionConte
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
-import org.aspectj.lang.reflect.MethodSignature;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
-import jakarta.persistence.EntityManager;
-import jakarta.persistence.Id;
-import jakarta.persistence.PersistenceContext;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 
 /**
- * Intercept service layer methods yang di-annotate dengan @TrackOperation
- * Lebih reliable daripada intercept repository proxy
+ * Intercept service layer methods dengan @TrackOperation
+ * 
+ * DIGUNAKAN UNTUK:
+ * - Bulk operations (BULK_UPDATE, BULK_DELETE)
+ * - Native queries (NATIVE_QUERY)
+ * - Stored procedures (STORED_PROCEDURE)
+ * 
+ * TIDAK DIGUNAKAN untuk entity operations sederhana (INSERT/UPDATE/DELETE)
+ * karena sudah di-handle oleh EntityOperationListener
  */
 @Aspect
 @Component
@@ -29,10 +30,6 @@ import java.lang.reflect.Method;
 public class ServiceOperationInterceptor {
     
     private static final Logger log = LoggerFactory.getLogger(ServiceOperationInterceptor.class);
-    
-    @PersistenceContext
-    private EntityManager entityManager;
-    
     private final ObjectMapper objectMapper;
     
     public ServiceOperationInterceptor(ObjectMapper objectMapper) {
@@ -44,103 +41,43 @@ public class ServiceOperationInterceptor {
         
         DistributedTransactionContext ctx = DistributedTransactionContext.get();
         if (ctx == null || !ctx.isActive()) {
-            return pjp.proceed();
-        }
-        
-        Object[] args = pjp.getArgs();
-        if (args.length == 0) {
-            return pjp.proceed();
-        }
-        
-        Object entity = findEntity(args);
-        if (entity == null) {
+            log.debug("No active distributed transaction context - executing without tracking");
             return pjp.proceed();
         }
         
         OperationType opType = trackOperation.type();
-        Object snapshot = null;
-        Object entityIdBefore = null;
         
-        // Take snapshot BEFORE operation
-        if (opType == OperationType.UPDATE || opType == OperationType.DELETE) {
-            entityIdBefore = extractEntityId(entity);
-            snapshot = createDeepCopy(entity);
+        // Complex operations yang perlu manual tracking
+        if (isComplexOperation(opType)) {
+            log.debug("Tracking complex operation: {} on {}", opType, trackOperation.datasource());
+            return trackComplexOperation(pjp, trackOperation, ctx);
         }
         
-        // Execute operation
+        // Simple entity operations akan di-handle oleh EntityOperationListener
+        log.debug("Simple operation {} - will be tracked by EntityOperationListener", opType);
+        return pjp.proceed();
+    }
+    
+    private boolean isComplexOperation(OperationType type) {
+        return type == OperationType.BULK_UPDATE ||
+               type == OperationType.BULK_DELETE ||
+               type == OperationType.NATIVE_QUERY ||
+               type == OperationType.STORED_PROCEDURE;
+    }
+    
+    private Object trackComplexOperation(ProceedingJoinPoint pjp, 
+                                         TrackOperation trackOperation,
+                                         DistributedTransactionContext ctx) throws Throwable {
+        
+        // Note: Developer must manually call recordBulkOperation(), recordNativeQuery(), etc.
+        // inside the method before executing the operation
+        // This interceptor just logs the operation type
+        
         Object result = pjp.proceed();
         
-        // Get entity ID after operation (for INSERT)
-        Object entityId = (opType == OperationType.INSERT) 
-            ? extractEntityId(result != null ? result : entity)
-            : entityIdBefore;
-        
-        // Record to transaction log
-        ctx.recordOperation(
-            trackOperation.datasource(),
-            opType,
-            entity.getClass().getName(),
-            entityId,
-            snapshot
-        );
-        
-        log.debug("Tracked {} on {} [id={}] in {}", 
-            opType, entity.getClass().getSimpleName(), entityId, trackOperation.datasource());
+        log.info("Complex operation {} executed on {}", 
+            trackOperation.type(), trackOperation.datasource());
         
         return result;
-    }
-    
-    private Object findEntity(Object[] args) {
-        for (Object arg : args) {
-            if (arg != null && hasIdAnnotation(arg.getClass())) {
-                return arg;
-            }
-        }
-        return null;
-    }
-    
-    private boolean hasIdAnnotation(Class<?> clazz) {
-        for (Field field : clazz.getDeclaredFields()) {
-            if (field.isAnnotationPresent(Id.class)) {
-                return true;
-            }
-        }
-        return false;
-    }
-    
-    private Object extractEntityId(Object entity) {
-        if (entity == null) return null;
-        
-        try {
-            // Find @Id field
-            for (Field field : entity.getClass().getDeclaredFields()) {
-                if (field.isAnnotationPresent(Id.class)) {
-                    field.setAccessible(true);
-                    return field.get(entity);
-                }
-            }
-            
-            // Fallback: try getId()
-            try {
-                Method getter = entity.getClass().getMethod("getId");
-                return getter.invoke(entity);
-            } catch (NoSuchMethodException ignored) {}
-            
-        } catch (Exception e) {
-            log.warn("Cannot extract entity ID from {}", entity.getClass().getSimpleName(), e);
-        }
-        
-        return null;
-    }
-    
-    private Object createDeepCopy(Object entity) {
-        try {
-            // Use Jackson for deep copy
-            String json = objectMapper.writeValueAsString(entity);
-            return objectMapper.readValue(json, entity.getClass());
-        } catch (Exception e) {
-            log.error("Cannot create deep copy of {}", entity.getClass().getSimpleName(), e);
-            return null;
-        }
     }
 }
