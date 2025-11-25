@@ -1,194 +1,142 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# TEST CONFIGURATIONS - All Valid Scenarios
-# ═══════════════════════════════════════════════════════════════════════════
-# Use these to test your application startup
-# Each scenario should start WITHOUT ERRORS
+# SAKTI TRANSACTION COORDINATOR v1.0.0
+# ENTERPRISE-GRADE: Automatic Multi-DB Rollback WITHOUT XA
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TEST 1: ALL DISABLED (Should work - no beans created)
+# MANDATORY: Dragonfly/Redis Configuration
 # ═══════════════════════════════════════════════════════════════════════════
-# Expected beans: NONE (except Spring Boot defaults)
-# Expected startup: ✅ SUCCESS
-# ═══════════════════════════════════════════════════════════════════════════
-
-#sakti.tx.dragonfly.enabled=false
-#sakti.tx.lock.enabled=false
-#sakti.tx.cache.enabled=false
-#sakti.tx.idempotency.enabled=false
-#sakti.tx.jms.enabled=false
-#sakti.tx.multi-db.enabled=false
-#sakti.tx.circuit-breaker.enabled=false
-#sakti.tx.health.enabled=false
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TEST 2: LOCK ONLY (Most common scenario)
-# ═══════════════════════════════════════════════════════════════════════════
-# Expected beans created:
-# - RedissonClient
-# - LockManager
-# - DragonflyHealthIndicator
-# - SaktiLockAspect
-# - DistributedLockService
-#
-# Expected beans NOT created:
-# - IdempotencyManager ❌
-# - SaktiIdempotentAspect ❌ (no error because conditional)
-# - CacheManager ❌
-# - SaktiCacheAspect ❌
-#
-# Expected startup: ✅ SUCCESS
-# ═══════════════════════════════════════════════════════════════════════════
-
-#sakti.tx.dragonfly.enabled=true
-#sakti.tx.dragonfly.url=redis://localhost:6379
-#sakti.tx.dragonfly.password=
-#
-#sakti.tx.lock.enabled=true
-#sakti.tx.cache.enabled=false
-#sakti.tx.idempotency.enabled=false
-#sakti.tx.jms.enabled=false
-#sakti.tx.multi-db.enabled=false
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TEST 3: LOCK + CACHE (No Idempotency)
-# ═══════════════════════════════════════════════════════════════════════════
-# Expected beans created:
-# - RedissonClient
-# - LockManager
-# - CacheManager
-# - DragonflyHealthIndicator
-# - SaktiLockAspect
-# - SaktiCacheAspect
-# - DistributedLockService
-#
-# Expected beans NOT created:
-# - IdempotencyManager ❌
-# - SaktiIdempotentAspect ❌
-#
-# Expected startup: ✅ SUCCESS
-# ═══════════════════════════════════════════════════════════════════════════
-
-#sakti.tx.dragonfly.enabled=true
-#sakti.tx.dragonfly.url=redis://localhost:6379
-#
-#sakti.tx.lock.enabled=true
-#sakti.tx.cache.enabled=true
-#sakti.tx.idempotency.enabled=false
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TEST 4: LOCK + IDEMPOTENCY (No Cache)
-# ═══════════════════════════════════════════════════════════════════════════
-# Expected beans created:
-# - RedissonClient
-# - LockManager
-# - IdempotencyManager ✅
-# - DragonflyHealthIndicator
-# - SaktiLockAspect
-# - SaktiIdempotentAspect ✅
-# - DistributedLockService
-#
-# Expected startup: ✅ SUCCESS
-# ═══════════════════════════════════════════════════════════════════════════
-
-#sakti.tx.dragonfly.enabled=true
-#sakti.tx.dragonfly.url=redis://localhost:6379
-#
-#sakti.tx.lock.enabled=true
-#sakti.tx.cache.enabled=false
-#sakti.tx.idempotency.enabled=true
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TEST 5: FULL STACK (All features enabled)
-# ═══════════════════════════════════════════════════════════════════════════
-# Expected beans created: ALL
-# Expected startup: ✅ SUCCESS (if Redis + ActiveMQ available)
-# ═══════════════════════════════════════════════════════════════════════════
-
 sakti.tx.dragonfly.enabled=true
-sakti.tx.dragonfly.url=redis://localhost:6379
-sakti.tx.dragonfly.password=
+sakti.tx.dragonfly.url=redis://dragonfly-ha.sakti.svc.cluster.local:6379
+sakti.tx.dragonfly.password=${DRAGONFLY_PASSWORD:}
+sakti.tx.dragonfly.timeout=3000
+sakti.tx.dragonfly.connect-timeout=5000
 
+# Connection pool
+sakti.tx.dragonfly.pool.size=64
+sakti.tx.dragonfly.pool.min-idle=10
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DISTRIBUTED TRANSACTION (NEW - AUTO ROLLBACK!)
+# ═══════════════════════════════════════════════════════════════════════════
+# ✅ Enable untuk auto-tracking + auto-rollback
+# ✅ Requires: Dragonfly enabled
+sakti.tx.multi-db.enabled=true
+sakti.tx.multi-db.rollback-strategy=COMPENSATING
+
+# Transaction log retention (hours)
+sakti.tx.multi-db.log-retention-hours=72
+
+# Rollback retry configuration
+sakti.tx.multi-db.max-retry-attempts=3
+sakti.tx.multi-db.retry-backoff-ms=1000
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DISTRIBUTED LOCK (OPTIONAL - but recommended for concurrent access)
+# ═══════════════════════════════════════════════════════════════════════════
 sakti.tx.lock.enabled=true
-sakti.tx.cache.enabled=true
-sakti.tx.idempotency.enabled=true
+sakti.tx.lock.prefix=sakti:lock:
+sakti.tx.lock.wait-time-ms=5000
+sakti.tx.lock.lease-time-ms=30000
 
+# ═══════════════════════════════════════════════════════════════════════════
+# IDEMPOTENCY (OPTIONAL - but recommended for financial transactions)
+# ═══════════════════════════════════════════════════════════════════════════
+sakti.tx.idempotency.enabled=true
+sakti.tx.idempotency.prefix=sakti:idemp:
+sakti.tx.idempotency.ttl-seconds=7200
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CACHE (OPTIONAL - for performance)
+# ═══════════════════════════════════════════════════════════════════════════
+sakti.tx.cache.enabled=true
+sakti.tx.cache.prefix=sakti:cache:
+sakti.tx.cache.default-ttl-seconds=600
+sakti.tx.cache.max-entries=10000
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CIRCUIT BREAKER (RECOMMENDED)
+# ═══════════════════════════════════════════════════════════════════════════
 sakti.tx.circuit-breaker.enabled=true
 sakti.tx.circuit-breaker.failure-threshold=5
 sakti.tx.circuit-breaker.recovery-timeout-ms=30000
 
-sakti.tx.jms.enabled=false
-#sakti.tx.jms.broker-url=tcp://localhost:61616
-#sakti.tx.jms.user=admin
-#sakti.tx.jms.password=admin
-
-sakti.tx.multi-db.enabled=true
-sakti.tx.multi-db.rollback-strategy=COMPENSATING
-
+# ═══════════════════════════════════════════════════════════════════════════
+# HEALTH CHECK (RECOMMENDED for production)
+# ═══════════════════════════════════════════════════════════════════════════
 sakti.tx.health.enabled=true
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TEST 6: INVALID CONFIGURATION (Should show error in logs but not crash)
+# JMS (OPTIONAL - not needed for sync transactions)
 # ═══════════════════════════════════════════════════════════════════════════
-# This will show validation errors in logs:
-# ❌ CONFIGURATION ERROR: sakti.tx.lock.enabled=true requires sakti.tx.dragonfly.enabled=true
-#
-# Expected beans created: NONE (conditionals not met)
-# Expected startup: ✅ SUCCESS (with warnings in logs)
-# ═══════════════════════════════════════════════════════════════════════════
-
-#sakti.tx.dragonfly.enabled=false
-#sakti.tx.lock.enabled=true
-#sakti.tx.idempotency.enabled=true
+sakti.tx.jms.enabled=false
+# sakti.tx.jms.broker-url=tcp://artemis-service:61616
+# sakti.tx.jms.user=admin
+# sakti.tx.jms.password=admin
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TEST 7: MULTI-DB ONLY (No Redis needed)
+# PRODUCTION CONFIGURATION EXAMPLE
 # ═══════════════════════════════════════════════════════════════════════════
-# Expected beans created:
-# - SaktiDistributedTxAspect only
+# For SAKTI application with multi-database setup:
 #
-# Expected startup: ✅ SUCCESS
+# Features enabled:
+# ✅ Distributed Transaction (auto-rollback across DBs)
+# ✅ Distributed Lock (prevent concurrent modifications)
+# ✅ Idempotency (prevent duplicate transactions)
+# ✅ Cache (improve read performance)
+# ✅ Circuit Breaker (graceful degradation)
+# ✅ Health Check (monitoring)
+#
+# Features disabled:
+# ❌ JMS (not needed for synchronous transactions)
+#
 # ═══════════════════════════════════════════════════════════════════════════
 
-#sakti.tx.dragonfly.enabled=false
-#sakti.tx.lock.enabled=false
-#sakti.tx.cache.enabled=false
-#sakti.tx.idempotency.enabled=false
-#sakti.tx.jms.enabled=false
-#sakti.tx.multi-db.enabled=true
+# ═══════════════════════════════════════════════════════════════════════════
+# MONITORING & ALERTING
+# ═══════════════════════════════════════════════════════════════════════════
+# Check failed transactions:
+# GET /admin/transactions/failed
+#
+# Retry failed transaction:
+# POST /admin/transactions/retry/{txId}
+#
+# Get transaction details:
+# GET /admin/transactions/{txId}
+#
+# Health check:
+# GET /actuator/health
+#
+# ═══════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DEBUGGING TIPS
+# TESTING CONFIGURATIONS
 # ═══════════════════════════════════════════════════════════════════════════
-#
-# 1. Enable DEBUG logging to see bean creation:
-#    logging.level.id.go.kemenkeu.djpbn.sakti.tx=DEBUG
-#
-# 2. Check which beans are created:
-#    logging.level.org.springframework.boot.autoconfigure=DEBUG
-#
-# 3. View conditional evaluation report:
-#    Add --debug flag when starting application
-#
-# 4. Expected log pattern on success:
-#    ═══════════════════════════════════════════════════════════
-#    🚀 SAKTI Transaction Coordinator v1.0.2 - Initializing...
-#    ═══════════════════════════════════════════════════════════
-#    ✅ Dragonfly/Redis - ENABLED (redis://localhost:6379)
-#    ✅ Distributed Lock - ENABLED (✅ ready)
-#    ⚪ Cache Manager - DISABLED
-#    ⚪ Idempotency - DISABLED
-#    ...
-#    🔧 Creating RedissonClient: redis://localhost:6379
-#    ✅ RedissonClient created and tested successfully
-#    ✅ Creating LockManager (RedissonLockManager)
-#    ✅ Creating DragonflyHealthIndicator
-#    ✅ Creating SaktiLockAspect
-#    ✅ Creating DistributedLockService
-#
-# 5. If you see "Unsatisfied dependency" error:
-#    - Check if required feature is enabled in properties
-#    - Check if Dragonfly is enabled for lock/cache/idempotency
-#    - Verify Redis connectivity
-#
+
+# --- TEST 1: Minimal (Lock Only) ---
+# sakti.tx.dragonfly.enabled=true
+# sakti.tx.dragonfly.url=redis://localhost:6379
+# sakti.tx.lock.enabled=true
+# sakti.tx.multi-db.enabled=false
+# sakti.tx.cache.enabled=false
+# sakti.tx.idempotency.enabled=false
+
+# --- TEST 2: Full Stack (Recommended for Production) ---
+# sakti.tx.dragonfly.enabled=true
+# sakti.tx.dragonfly.url=redis://dragonfly-ha:6379
+# sakti.tx.multi-db.enabled=true
+# sakti.tx.lock.enabled=true
+# sakti.tx.cache.enabled=true
+# sakti.tx.idempotency.enabled=true
+# sakti.tx.circuit-breaker.enabled=true
+# sakti.tx.health.enabled=true
+
+# --- TEST 3: Distributed Transaction Only (No Lock/Cache) ---
+# sakti.tx.dragonfly.enabled=true
+# sakti.tx.dragonfly.url=redis://localhost:6379
+# sakti.tx.multi-db.enabled=true
+# sakti.tx.lock.enabled=false
+# sakti.tx.cache.enabled=false
+# sakti.tx.idempotency.enabled=false
+
 # ═══════════════════════════════════════════════════════════════════════════

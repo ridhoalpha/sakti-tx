@@ -11,6 +11,7 @@ import org.aspectj.lang.reflect.MethodSignature;
 import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.expression.ExpressionParser;
 import org.springframework.expression.spel.standard.SpelExpressionParser;
 import org.springframework.expression.spel.support.StandardEvaluationContext;
@@ -24,23 +25,23 @@ public class SaktiIdempotentAspect {
     
     private static final Logger log = LoggerFactory.getLogger(SaktiIdempotentAspect.class);
     
-    private final IdempotencyManager idempotencyManager;
     private final SaktiTxProperties properties;
+    private final IdempotencyManager idempotencyManager;
     private final RedissonClient redissonClient;
     private final ExpressionParser parser = new SpelExpressionParser();
     
-    public SaktiIdempotentAspect(IdempotencyManager idempotencyManager,
-                                SaktiTxProperties properties,
-                                RedissonClient redissonClient) {
-        this.idempotencyManager = idempotencyManager;
+    public SaktiIdempotentAspect(SaktiTxProperties properties,
+                                @Autowired(required = false) IdempotencyManager idempotencyManager,
+                                @Autowired(required = false) RedissonClient redissonClient) {
         this.properties = properties;
+        this.idempotencyManager = idempotencyManager;
         this.redissonClient = redissonClient;
         log.debug("SaktiIdempotentAspect initialized successfully");
     }
     
     @Around("@annotation(id.go.kemenkeu.djpbn.sakti.tx.starter.annotation.SaktiIdempotent)")
     public Object around(ProceedingJoinPoint pjp) throws Throwable {
-        if (!properties.getIdempotency().isEnabled() || !isRedisHealthy()) {
+        if (idempotencyManager == null || !properties.getIdempotency().isEnabled() || !isRedisHealthy()) {
             log.debug("Idempotency disabled or Redis unhealthy - executing without check");
             return pjp.proceed();
         }

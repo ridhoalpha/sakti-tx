@@ -12,7 +12,7 @@ import java.util.Map;
  * JMS Event Publisher for publishing messages to ActiveMQ Artemis
  * Supports both Queue and Topic messaging patterns
  * 
- * ✅ FIXED: Constructor accepts Object type to avoid ClassNotFoundException at startup
+ * FIXED: Constructor accepts Object type to avoid ClassNotFoundException at startup
  */
 public class JmsEventPublisher {
     
@@ -36,7 +36,7 @@ public class JmsEventPublisher {
         if (connectionFactory instanceof ConnectionFactory) {
             this.connectionFactory = (ConnectionFactory) connectionFactory;
         } else {
-            log.error("❌ Invalid ConnectionFactory type: {}", 
+            log.error("Invalid ConnectionFactory type: {}", 
                 connectionFactory != null ? connectionFactory.getClass().getName() : "null");
             this.connectionFactory = null;
         }
@@ -45,9 +45,9 @@ public class JmsEventPublisher {
         this.enabled = properties.getJms().isEnabled();
         
         if (this.connectionFactory == null) {
-            log.error("❌ JmsEventPublisher created but ConnectionFactory is null - operations will fail");
+            log.error("JmsEventPublisher created but ConnectionFactory is null - operations will fail");
         } else {
-            log.info("✅ JmsEventPublisher initialized successfully");
+            log.info("JmsEventPublisher initialized successfully");
         }
     }
     

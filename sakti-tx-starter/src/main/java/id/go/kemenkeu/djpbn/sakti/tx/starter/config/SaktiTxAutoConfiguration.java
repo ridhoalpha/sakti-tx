@@ -2,12 +2,16 @@ package id.go.kemenkeu.djpbn.sakti.tx.starter.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import id.go.kemenkeu.djpbn.sakti.tx.core.cache.CacheManager;
+import id.go.kemenkeu.djpbn.sakti.tx.core.compensate.CompensatingTransactionExecutor;
 import id.go.kemenkeu.djpbn.sakti.tx.core.idempotency.IdempotencyManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.lock.LockManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.lock.RedissonLockManager;
+import id.go.kemenkeu.djpbn.sakti.tx.core.log.TransactionLogManager;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.aspect.*;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.event.JmsEventPublisher;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.health.DragonflyHealthIndicator;
+import id.go.kemenkeu.djpbn.sakti.tx.starter.interceptor.RepositoryOperationInterceptor;
+import id.go.kemenkeu.djpbn.sakti.tx.starter.interceptor.ServiceOperationInterceptor;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.service.DistributedLockService;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.service.impl.DistributedLockServiceImpl;
 import jakarta.jms.ConnectionFactory;
@@ -27,6 +31,8 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 import jakarta.annotation.PostConstruct;
+import jakarta.persistence.EntityManager;
+import java.util.Map;
 
 @Configuration
 @EnableConfigurationProperties(SaktiTxProperties.class)
@@ -43,7 +49,7 @@ public class SaktiTxAutoConfiguration {
     @PostConstruct
     public void validateConfiguration() {
         log.info("═══════════════════════════════════════════════════════════");
-        log.info("SAKTI Transaction Coordinator v1.0.2 - Initializing...");
+        log.info("SAKTI Transaction Coordinator v1.0.0 - Initializing...");
         log.info("═══════════════════════════════════════════════════════════");
         
         boolean hasErrors = false;
@@ -65,6 +71,10 @@ public class SaktiTxAutoConfiguration {
                 log.error("   → Solution: Set sakti.tx.dragonfly.enabled=true OR sakti.tx.idempotency.enabled=false");
                 hasErrors = true;
             }
+            if (properties.getMultiDb().isEnabled()) {
+                log.error("CONFIGURATION ERROR: sakti.tx.multi-db.enabled=true requires sakti.tx.dragonfly.enabled=true");
+                hasErrors = true;
+            }
             if (!hasErrors) {
                 log.warn("Dragonfly is DISABLED - lock/cache/idempotency features will not work");
             }
@@ -78,9 +88,10 @@ public class SaktiTxAutoConfiguration {
         
         logFeatureStatus("Dragonfly/Redis", properties.getDragonfly().isEnabled(), 
             properties.getDragonfly().isEnabled() ? maskUrl(properties.getDragonfly().getUrl()) : "disabled");
+        logFeatureStatus("Distributed Transaction", properties.getMultiDb().isEnabled(), 
+            properties.getMultiDb().getRollbackStrategy().toString());
         logFeatureStatus("Distributed Lock", properties.getLock().isEnabled(), 
-            getDependencyStatus(properties.getLock().isEnabled(), properties.getDragonfly().isEnabled()));
-        logFeatureStatus("Cache Manager", properties.getCache().isEnabled(), 
+            getDependencyStatus(properties.getLock().isEnabled(), properties.getDragonfly().isEnabled()));logFeatureStatus("Cache Manager", properties.getCache().isEnabled(), 
             getDependencyStatus(properties.getCache().isEnabled(), properties.getDragonfly().isEnabled()));
         logFeatureStatus("Idempotency", properties.getIdempotency().isEnabled(), 
             getDependencyStatus(properties.getIdempotency().isEnabled(), properties.getDragonfly().isEnabled()));
@@ -88,10 +99,7 @@ public class SaktiTxAutoConfiguration {
             "threshold=" + properties.getCircuitBreaker().getFailureThreshold());
         logFeatureStatus("JMS Events", properties.getJms().isEnabled(), 
             properties.getJms().isEnabled() ? "enabled" : "disabled");
-        logFeatureStatus("Multi-DB Transaction", properties.getMultiDb().isEnabled(), 
-            properties.getMultiDb().getRollbackStrategy().toString());
         logFeatureStatus("Health Indicator", properties.getHealth().isEnabled(), "actuator");
-        
         log.info("═══════════════════════════════════════════════════════════");
     }
     
@@ -141,10 +149,9 @@ public class SaktiTxAutoConfiguration {
                     .setRetryInterval(1500);
 
             RedissonClient client = Redisson.create(config);
-            
             client.getKeys().count();
             
-            log.info("RedissonClient created and tested successfully");
+            log.info("RedissonClient created successfully");
             return client;
         } catch (Exception e) {
             log.error("Failed to create RedissonClient: {}", e.getMessage());
@@ -158,7 +165,7 @@ public class SaktiTxAutoConfiguration {
     @ConditionalOnProperty(prefix = "sakti.tx.lock", name = "enabled", havingValue = "true")
     @ConditionalOnBean(RedissonClient.class)
     public LockManager lockManager(RedissonClient redissonClient) {
-        log.info("Creating LockManager (RedissonLockManager)");
+        log.info("Creating LockManager");
         return new RedissonLockManager(redissonClient);
     }
 
@@ -221,26 +228,19 @@ public class SaktiTxAutoConfiguration {
     }
 
     @Bean
+    @ConditionalOnMissingBean(SaktiIdempotentAspect.class)
     @ConditionalOnProperty(prefix = "sakti.tx.idempotency", name = "enabled", havingValue = "true")
     @ConditionalOnBean(IdempotencyManager.class)
     public SaktiIdempotentAspect saktiIdempotentAspect(
-            IdempotencyManager idempotencyManager,
             SaktiTxProperties properties,
+            @Autowired(required = false) IdempotencyManager idempotencyManager,
             @Autowired(required = false) RedissonClient redissonClient) {
         log.info("Creating SaktiIdempotentAspect");
-        return new SaktiIdempotentAspect(idempotencyManager, properties, redissonClient);
+        return new SaktiIdempotentAspect(properties, idempotencyManager, redissonClient);
     }
 
     @Bean
-    @ConditionalOnMissingBean(SaktiDistributedTxAspect.class)
-    @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
-    public SaktiDistributedTxAspect saktiDistributedTxAspect(SaktiTxProperties properties) {
-        log.info("Creating SaktiDistributedTxAspect");
-        return new SaktiDistributedTxAspect(properties);
-    }
-
-    @Bean
-    @ConditionalOnMissingBean(DistributedLockService.class)
+    @ConditionalOnMissingBean({DistributedLockService.class, IdempotencyManager.class})
     @ConditionalOnProperty(prefix = "sakti.tx.lock", name = "enabled", havingValue = "true")
     @ConditionalOnBean(LockManager.class)
     public DistributedLockService distributedLockService(
@@ -268,149 +268,325 @@ public class SaktiTxAutoConfiguration {
         log.info("Creating DistributedLockService");
         return new DistributedLockServiceImpl(lockManager, idempotencyManager, healthIndicator, properties);
     }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
+    @ConditionalOnBean(RedissonClient.class)
+    public TransactionLogManager transactionLogManager(
+            RedissonClient redissonClient,
+            ObjectMapper objectMapper) {
+        log.info("Creating TransactionLogManager");
+        return new TransactionLogManager(redissonClient, objectMapper);
+    }
     
+    @Bean
+    @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
+    public CompensatingTransactionExecutor compensatingTransactionExecutor(
+            ApplicationContext applicationContext,
+            ObjectMapper objectMapper) {
+        log.info("Creating CompensatingTransactionExecutor");
+        
+        Map<String, EntityManager> entityManagers = applicationContext.getBeansOfType(EntityManager.class);
+        
+        if (entityManagers.isEmpty()) {
+            log.warn("No EntityManager beans found - compensating transactions may fail");
+        } else {
+            log.info("Found {} EntityManager beans", entityManagers.size());
+        }
+        
+        return new CompensatingTransactionExecutor(entityManagers, objectMapper);
+    }
+    
+    @Bean
+    @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
+    public ServiceOperationInterceptor serviceOperationInterceptor(ObjectMapper objectMapper) {
+        log.info("Creating ServiceOperationInterceptor");
+        return new ServiceOperationInterceptor(objectMapper);
+    }
+    
+    @Bean
+    @ConditionalOnMissingBean(SaktiDistributedTxAspect.class)
+    @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
+    @ConditionalOnBean({TransactionLogManager.class, CompensatingTransactionExecutor.class})
+    public SaktiDistributedTxAspect saktiDistributedTxAspect(
+            SaktiTxProperties properties,
+            TransactionLogManager logManager,
+            CompensatingTransactionExecutor compensator,
+            @Autowired(required = false) LockManager lockManager) {
+        log.info("Creating SaktiDistributedTxAspect");
+        return new SaktiDistributedTxAspect(properties, logManager, compensator, lockManager);
+    }
+    
+    @Bean
+    @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
+    public RepositoryOperationInterceptor repositoryOperationInterceptor() {
+        log.info("Creating RepositoryOperationInterceptor (auto-tracking)");
+        return new RepositoryOperationInterceptor();
+    }
+
+    /**
+     * IMPROVED JMS BEAN CONFIGURATION
+     * 
+     * SCENARIOS HANDLED:
+     * 1. User provides ConnectionFactory bean → use that
+     * 2. User sets broker-url + has artemis-jakarta-client → auto-create
+     * 3. User sets broker-url but NO artemis-jakarta-client → log error + skip
+     * 4. JMS disabled → skip
+     * 5. jakarta.jms NOT in classpath → skip silently
+     */
     @Bean
     @ConditionalOnMissingBean(JmsEventPublisher.class)
     @ConditionalOnProperty(prefix = "sakti.tx.jms", name = "enabled", havingValue = "true")
-    @ConditionalOnClass(name = "jakarta.jms.ConnectionFactory")
     public JmsEventPublisher jmsEventPublisher(
             ApplicationContext applicationContext,
             SaktiTxProperties properties) {
         
-        log.info("Initializing JMS Event Publisher...");
+        log.info("═══════════════════════════════════════════════════════════");
+        log.info("JMS Event Publisher - Initialization");
+        log.info("═══════════════════════════════════════════════════════════");
         
         Object connectionFactory = null;
         String factorySource = null;
         
         try {
-            Class<?> connectionFactoryClass;
+            // ═══════════════════════════════════════════════════════════════
+            // STEP 1: Check if jakarta.jms.ConnectionFactory exists
+            // ═══════════════════════════════════════════════════════════════
+            Class<?> connectionFactoryClass = null;
             try {
                 connectionFactoryClass = Class.forName("jakarta.jms.ConnectionFactory");
+                log.debug("jakarta.jms.ConnectionFactory found in classpath");
             } catch (ClassNotFoundException e) {
-                log.error("jakarta.jms.ConnectionFactory not found - this should not happen due to @ConditionalOnClass");
-                return null;
+                // Should not happen due to @ConditionalOnClass, but safety check
+                log.warn("jakarta.jms.ConnectionFactory not found");
             }
 
-            String existingBeanName = properties.getJms().getExistingFactoryBeanName();
-            if (existingBeanName != null && !existingBeanName.trim().isEmpty()) {
-                try {
-                    connectionFactory = applicationContext.getBean(existingBeanName, connectionFactoryClass);
-                    factorySource = "existing bean: " + existingBeanName;
-                    log.info("Found existing ConnectionFactory: {}", existingBeanName);
-                } catch (Exception e) {
-                    log.warn("Cannot find ConnectionFactory bean: {} - {}", existingBeanName, e.getMessage());
+            if (connectionFactoryClass != null) {
+                // ═══════════════════════════════════════════════════════════════
+                // STEP 2: Try to use existing ConnectionFactory bean (if provided)
+                // ═══════════════════════════════════════════════════════════════
+                String existingBeanName = properties.getJms().getExistingFactoryBeanName();
+                if (existingBeanName != null && !existingBeanName.trim().isEmpty()) {
+                    try {
+                        connectionFactory = applicationContext.getBean(existingBeanName, connectionFactoryClass);
+                        factorySource = "existing bean: " + existingBeanName;
+                        log.info("Using existing ConnectionFactory: {}", existingBeanName);
+                    } catch (Exception e) {
+                        log.warn("Cannot find ConnectionFactory bean '{}': {}", 
+                            existingBeanName, e.getMessage());
+                    }
                 }
+                
+                // ═══════════════════════════════════════════════════════════════
+                // STEP 3: Try to get default ConnectionFactory bean
+                // ═══════════════════════════════════════════════════════════════
+                if (connectionFactory == null) {
+                    try {
+                        connectionFactory = applicationContext.getBean(connectionFactoryClass);
+                        factorySource = "default bean";
+                        log.info("Using default ConnectionFactory bean");
+                    } catch (Exception e) {
+                        log.debug("No default ConnectionFactory bean found");
+                    }
+                }   
             }
             
-            // ═════════════════════════════════════════════════════════════════
-            // STEP 3: Try to get default ConnectionFactory bean
-            // ═════════════════════════════════════════════════════════════════
-            if (connectionFactory == null) {
-                try {
-                    connectionFactory = applicationContext.getBean(connectionFactoryClass);
-                    factorySource = "default bean";
-                    log.info("Found default ConnectionFactory");
-                } catch (Exception e) {
-                    log.debug("No default ConnectionFactory found");
-                }
-            }
-            
-            // ═════════════════════════════════════════════════════════════════
-            // STEP 4: Try to create new ActiveMQ ConnectionFactory
-            // ═════════════════════════════════════════════════════════════════
+            // ═══════════════════════════════════════════════════════════════
+            // STEP 4: Try to auto-create ActiveMQ ConnectionFactory
+            // ═══════════════════════════════════════════════════════════════
             if (connectionFactory == null) {
                 String brokerUrl = properties.getJms().getBrokerUrl();
                 
                 if (brokerUrl == null || brokerUrl.trim().isEmpty()) {
-                    log.error("JMS Configuration Error:");
-                    log.error("   → sakti.tx.jms.enabled=true but no ConnectionFactory available");
-                    log.error("   → Solutions:");
-                    log.error("      1. Set sakti.tx.jms.existing-factory-bean-name=yourBeanName");
-                    log.error("      2. Set sakti.tx.jms.broker-url=tcp://host:port");
-                    log.error("      3. Create your own ConnectionFactory bean");
-                    log.error("      4. Disable JMS: sakti.tx.jms.enabled=false");
+                    log.error("═══════════════════════════════════════════════════════════");
+                    log.error("JMS Configuration Error");
+                    log.error("═══════════════════════════════════════════════════════════");
+                    log.error("sakti.tx.jms.enabled=true but no ConnectionFactory available");
+                    log.error("");
+                    log.error("Solutions:");
+                    log.error("  1. Provide existing ConnectionFactory:");
+                    log.error("     sakti.tx.jms.existing-factory-bean-name=myConnectionFactory");
+                    log.error("");
+                    log.error("  2. Auto-create new ConnectionFactory:");
+                    log.error("     sakti.tx.jms.broker-url=tcp://localhost:61616");
+                    log.error("     (requires artemis-jakarta-client dependency)");
+                    log.error("");
+                    log.error("  3. Create your own ConnectionFactory bean");
+                    log.error("");
+                    log.error("  4. Disable JMS:");
+                    log.error("     sakti.tx.jms.enabled=false");
+                    log.error("═══════════════════════════════════════════════════════════");
                     return null;
                 }
                 
                 // Try to create ActiveMQ ConnectionFactory
-                try {
-                    log.debug("Attempting to create ActiveMQConnectionFactory for: {}", brokerUrl);
-                    
-                    // Check if artemis-jakarta-client is in classpath
-                    Class<?> amqFactoryClass;
-                    try {
-                        amqFactoryClass = Class.forName("org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory");
-                    } catch (ClassNotFoundException e) {
-                        log.error("ActiveMQ Artemis client not found in classpath");
-                        log.error("   → Add dependency:");
-                        log.error("      <dependency>");
-                        log.error("        <groupId>org.apache.activemq</groupId>");
-                        log.error("        <artifactId>artemis-jakarta-client</artifactId>");
-                        log.error("        <version>2.38.0</version>");
-                        log.error("      </dependency>");
-                        log.error("   → Or disable JMS: sakti.tx.jms.enabled=false");
-                        return null;
-                    }
-                    
-                    // Create factory instance
-                    connectionFactory = amqFactoryClass
-                        .getDeclaredConstructor(String.class)
-                        .newInstance(brokerUrl);
-                    
-                    // Set credentials if provided
-                    String user = properties.getJms().getUser();
-                    String password = properties.getJms().getPassword();
-                    
-                    if (user != null && !user.trim().isEmpty()) {
-                        amqFactoryClass.getMethod("setUser", String.class)
-                            .invoke(connectionFactory, user);
-                        amqFactoryClass.getMethod("setPassword", String.class)
-                            .invoke(connectionFactory, password);
-                        log.debug("Set JMS credentials: user={}", user);
-                    }
-                    
-                    factorySource = "new ActiveMQConnectionFactory: " + brokerUrl;
-                    log.info("Created new ActiveMQConnectionFactory: {}", brokerUrl);
-                    
-                } catch (Exception e) {
-                    log.error("Failed to create ActiveMQConnectionFactory: {}", e.getMessage());
-                    log.error("   → Check broker URL: {}", brokerUrl);
-                    log.error("   → Verify artemis-jakarta-client dependency");
-                    return null;
+                connectionFactory = createActiveMQConnectionFactory(brokerUrl, properties);
+                if (connectionFactory != null) {
+                    factorySource = "auto-created ActiveMQConnectionFactory: " + brokerUrl;
                 }
             }
             
-            // ═════════════════════════════════════════════════════════════════
-            // STEP 5: Test connection (optional but recommended)
-            // ═════════════════════════════════════════════════════════════════
+            // ═══════════════════════════════════════════════════════════════
+            // STEP 5: Validate and test connection
+            // ═══════════════════════════════════════════════════════════════
+            if (connectionFactory == null) {
+                log.error("Failed to obtain or create ConnectionFactory");
+                return null;
+            }
+            
+            log.info("ConnectionFactory obtained: {}", factorySource);
+            
+            // Optional: Test connection on startup
             if (properties.getJms().isTestOnStartup()) {
                 if (!testJmsConnection(connectionFactory, factorySource)) {
                     log.warn("JMS connection test failed - bean will still be created");
-                    log.warn("   → JMS operations may fail at runtime");
-                    log.warn("   → Set sakti.tx.jms.test-on-startup=false to skip this test");
+                    log.warn("   JMS operations may fail at runtime");
+                } else {
+                    log.info("JMS connection test successful");
                 }
             }
             
-            // ═════════════════════════════════════════════════════════════════
+            // ═══════════════════════════════════════════════════════════════
             // STEP 6: Create JmsEventPublisher bean
-            // ═════════════════════════════════════════════════════════════════
-            log.info("Creating JmsEventPublisher (source: {})", factorySource);
+            // ═══════════════════════════════════════════════════════════════
+            log.info("Creating JmsEventPublisher");
+            log.info("═══════════════════════════════════════════════════════════");
             
-            // Cast to jakarta.jms.ConnectionFactory (safe because we checked the class)
             return new JmsEventPublisher(connectionFactory, properties);
             
         } catch (Exception e) {
-            log.error("Unexpected error during JMS initialization: {}", e.getMessage(), e);
-            log.error("   → Disable JMS if not needed: sakti.tx.jms.enabled=false");
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("Unexpected error during JMS initialization");
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("Error: {}", e.getMessage(), e);
+            log.error("");
+            log.error("Suggestions:");
+            log.error("  • Check ActiveMQ/Artemis is running");
+            log.error("  • Verify broker URL is correct");
+            log.error("  • Ensure artemis-jakarta-client dependency is present");
+            log.error("  • Disable JMS if not needed: sakti.tx.jms.enabled=false");
+            log.error("═══════════════════════════════════════════════════════════");
             return null;
         }
     }
-    
+
     /**
-     * Test JMS connection
-     * Uses reflection to avoid direct JMS type references
-     * Non-blocking, returns quickly
-     * Closes resources properly
+     * Create ActiveMQ Artemis ConnectionFactory using reflection
+     * 
+     * This method uses reflection to avoid hard dependency on artemis-jakarta-client.
+     * If the library is not in classpath, it will gracefully fail with clear instructions.
+     * 
+     * @return ConnectionFactory instance or null if creation failed
+     */
+    private Object createActiveMQConnectionFactory(String brokerUrl, SaktiTxProperties properties) {
+        
+        log.info("Attempting to auto-create ActiveMQConnectionFactory...");
+        log.info("Broker URL: {}", brokerUrl);
+        
+        try {
+            // ═══════════════════════════════════════════════════════════════
+            // Check if artemis-jakarta-client is available
+            // ═══════════════════════════════════════════════════════════════
+            Class<?> amqFactoryClass;
+            try {
+                amqFactoryClass = Class.forName(
+                    "org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory"
+                );
+                log.debug("ActiveMQ Artemis client found in classpath");
+            } catch (ClassNotFoundException e) {
+                log.error("═══════════════════════════════════════════════════════════");
+                log.error("ActiveMQ Artemis client NOT found in classpath");
+                log.error("═══════════════════════════════════════════════════════════");
+                log.error("Cannot auto-create ConnectionFactory without artemis-jakarta-client");
+                log.error("");
+                log.error("Add this dependency to your pom.xml:");
+                log.error("");
+                log.error("  <dependency>");
+                log.error("    <groupId>org.apache.activemq</groupId>");
+                log.error("    <artifactId>artemis-jakarta-client</artifactId>");
+                log.error("    <version>2.38.0</version>");
+                log.error("  </dependency>");
+                log.error("");
+                log.error("OR provide your own ConnectionFactory bean");
+                log.error("OR disable JMS: sakti.tx.jms.enabled=false");
+                log.error("═══════════════════════════════════════════════════════════");
+                return null;
+            }
+            
+            // ═══════════════════════════════════════════════════════════════
+            // Create ActiveMQConnectionFactory instance
+            // ═══════════════════════════════════════════════════════════════
+            Object connectionFactory = amqFactoryClass
+                .getDeclaredConstructor(String.class)
+                .newInstance(brokerUrl);
+            
+            log.info("Created ActiveMQConnectionFactory instance");
+            
+            // ═══════════════════════════════════════════════════════════════
+            // Set credentials if provided
+            // ═══════════════════════════════════════════════════════════════
+            String user = properties.getJms().getUser();
+            String password = properties.getJms().getPassword();
+            
+            if (user != null && !user.trim().isEmpty()) {
+                amqFactoryClass.getMethod("setUser", String.class)
+                    .invoke(connectionFactory, user);
+                amqFactoryClass.getMethod("setPassword", String.class)
+                    .invoke(connectionFactory, password);
+                log.info("Set JMS credentials for user: {}", user);
+            }
+            
+            // ═══════════════════════════════════════════════════════════════
+            // Optional: Configure connection pool and other settings
+            // ═══════════════════════════════════════════════════════════════
+            try {
+                // Set reasonable defaults for production use
+                amqFactoryClass.getMethod("setConnectionTTL", long.class)
+                    .invoke(connectionFactory, 60000L); // 60 seconds
+                
+                amqFactoryClass.getMethod("setReconnectAttempts", int.class)
+                    .invoke(connectionFactory, -1); // Infinite reconnect
+                
+                amqFactoryClass.getMethod("setRetryInterval", long.class)
+                    .invoke(connectionFactory, 1000L); // 1 second
+                
+                log.debug("Configured ActiveMQ connection settings");
+            } catch (Exception e) {
+                // Non-critical - continue even if settings fail
+                log.debug("Could not configure advanced settings: {}", e.getMessage());
+            }
+            
+            log.info("ActiveMQConnectionFactory created successfully");
+            return connectionFactory;
+            
+        } catch (Exception e) {
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("Failed to create ActiveMQConnectionFactory");
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("Error: {}", e.getMessage());
+            log.error("Broker URL: {}", brokerUrl);
+            log.error("");
+            log.error("Possible causes:");
+            log.error("  • ActiveMQ/Artemis broker not running");
+            log.error("  • Incorrect broker URL format");
+            log.error("  • Network connectivity issues");
+            log.error("  • Authentication required but not provided");
+            log.error("");
+            log.error("Solutions:");
+            log.error("  • Verify broker is running: telnet host port");
+            log.error("  • Check URL format: tcp://host:port");
+            log.error("  • Provide credentials if needed:");
+            log.error("    sakti.tx.jms.user=admin");
+            log.error("    sakti.tx.jms.password=admin");
+            log.error("═══════════════════════════════════════════════════════════");
+            return null;
+        }
+    }
+
+    /**
+     * Test JMS connection (optional but recommended)
+     * 
+     * @return true if connection successful, false otherwise
      */
     private boolean testJmsConnection(Object connectionFactory, String source) {
         if (connectionFactory == null) {
@@ -429,12 +605,12 @@ public class SaktiTxAutoConfiguration {
             // Use reflection: connection.start()
             connectionObj.getClass().getMethod("start").invoke(connectionObj);
             
-            log.info("JMS connection test successful: {}", source);
+            log.info("JMS connection test successful");
             return true;
             
         } catch (Exception e) {
-            log.error("JMS connection test failed: {} - {}", source, e.getMessage());
-            log.error("   → Verify ActiveMQ/Artemis is running and accessible");
+            log.error("JMS connection test failed: {}", e.getMessage());
+            log.error("   Verify broker is running and accessible");
             return false;
             
         } finally {

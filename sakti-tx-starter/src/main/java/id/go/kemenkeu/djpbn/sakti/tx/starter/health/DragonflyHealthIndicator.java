@@ -67,7 +67,7 @@ public class DragonflyHealthIndicator implements HealthIndicator {
                 consecutiveFailures.set(0);
                 if (circuitState == CircuitState.HALF_OPEN) {
                     circuitState = CircuitState.CLOSED;
-                    log.info("✅ Circuit breaker CLOSED - Dragonfly recovered");
+                    log.info("Circuit breaker CLOSED - Dragonfly recovered");
                 }
             }
             
@@ -79,7 +79,7 @@ public class DragonflyHealthIndicator implements HealthIndicator {
                 .build();
                 
         } catch (Exception e) {
-            log.error("❌ Dragonfly health check failed: {}", e.getMessage());
+            log.error("Dragonfly health check failed: {}", e.getMessage());
             
             // Handle circuit breaker
             if (properties.getCircuitBreaker().isEnabled()) {
@@ -107,7 +107,7 @@ public class DragonflyHealthIndicator implements HealthIndicator {
         
         if (failures >= threshold && circuitState == CircuitState.CLOSED) {
             circuitState = CircuitState.OPEN;
-            log.error("🔴 Circuit breaker OPEN - Dragonfly unavailable after {} failures (threshold: {})", 
+            log.error("Circuit breaker OPEN - Dragonfly unavailable after {} failures (threshold: {})", 
                 failures, threshold);
             log.error("   → All lock/cache/idempotency operations will be bypassed");
             log.error("   → Will retry after {}ms", properties.getCircuitBreaker().getRecoveryTimeoutMs());
@@ -139,7 +139,7 @@ public class DragonflyHealthIndicator implements HealthIndicator {
         
         if (timeSinceLastFailure >= recoveryTimeout && circuitState == CircuitState.OPEN) {
             circuitState = CircuitState.HALF_OPEN;
-            log.info("🟡 Circuit breaker HALF_OPEN - Testing Dragonfly recovery...");
+            log.info("Circuit breaker HALF_OPEN - Testing Dragonfly recovery...");
             return false; // Allow test request
         }
         
@@ -188,6 +188,6 @@ public class DragonflyHealthIndicator implements HealthIndicator {
     public void resetCircuitBreaker() {
         consecutiveFailures.set(0);
         circuitState = CircuitState.CLOSED;
-        log.info("✅ Circuit breaker manually reset to CLOSED");
+        log.info("Circuit breaker manually reset to CLOSED");
     }
 }

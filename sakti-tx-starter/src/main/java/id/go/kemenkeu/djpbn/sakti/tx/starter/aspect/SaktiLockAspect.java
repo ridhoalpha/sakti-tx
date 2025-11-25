@@ -11,6 +11,7 @@ import org.aspectj.lang.reflect.MethodSignature;
 import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.expression.ExpressionParser;
 import org.springframework.expression.spel.standard.SpelExpressionParser;
 import org.springframework.expression.spel.support.StandardEvaluationContext;
@@ -31,7 +32,7 @@ public class SaktiLockAspect {
     
     public SaktiLockAspect(LockManager lockManager,
                           SaktiTxProperties properties,
-                          RedissonClient redissonClient) {
+                          @Autowired(required = false) RedissonClient redissonClient) {
         this.lockManager = lockManager;
         this.properties = properties;
         this.redissonClient = redissonClient;

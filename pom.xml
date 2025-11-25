@@ -7,7 +7,7 @@
     
     <groupId>id.go.kemenkeu.djpbn.sakti</groupId>
     <artifactId>sakti-tx-parent</artifactId>
-    <version>1.0.2</version>
+    <version>1.0.0</version>
     <packaging>pom</packaging>
     
     <name>SAKTI Transaction Coordinator</name>
@@ -137,4 +137,17 @@
             </plugins>
         </pluginManagement>
     </build>
+
+	<distributionManagement>
+		<snapshotRepository>
+			<id>fuses</id>
+			<name>Snapshots</name>
+			<url>http://admin:admin123@10.216.83.31:8081/nexus/content/repositories/fuses/</url>
+		</snapshotRepository>
+		<repository>
+			<id>fuser</id>
+			<name>Releases</name>
+			<url>http://admin:admin123@10.216.83.31:8081/nexus/content/repositories/fuser/</url>
+		</repository>
+	</distributionManagement>
 </project>

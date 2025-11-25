@@ -9,6 +9,7 @@ import id.go.kemenkeu.djpbn.sakti.tx.starter.health.DragonflyHealthIndicator;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.service.DistributedLockService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.function.Supplier;
@@ -19,16 +20,16 @@ public class DistributedLockServiceImpl implements DistributedLockService {
     private static final Logger log = LoggerFactory.getLogger(DistributedLockServiceImpl.class);
     
     private final LockManager lockManager;
-    private final IdempotencyManager idempotencyManager;  // ✅ Can be null!
+    private final IdempotencyManager idempotencyManager;
     private final DragonflyHealthIndicator healthIndicator;
     private final SaktiTxProperties properties;
     
     public DistributedLockServiceImpl(LockManager lockManager,
-                                     IdempotencyManager idempotencyManager,  // ✅ Can be null!
-                                     DragonflyHealthIndicator healthIndicator,
+                                     @Autowired(required = false) IdempotencyManager idempotencyManager,
+                                     @Autowired(required = false) DragonflyHealthIndicator healthIndicator,
                                      SaktiTxProperties properties) {
         this.lockManager = lockManager;
-        this.idempotencyManager = idempotencyManager;  // ✅ Can be null!
+        this.idempotencyManager = idempotencyManager;
         this.healthIndicator = healthIndicator;
         this.properties = properties;
     }
@@ -75,7 +76,7 @@ public class DistributedLockServiceImpl implements DistributedLockService {
     @Override
     public <T> T executeWithLockAndIdempotency(String lockKey, String idempotencyKey,
                                               Supplier<T> action) throws Exception {
-        // ✅ Check if idempotency is available
+        // Check if idempotency is available
         if (idempotencyManager == null || !properties.getIdempotency().isEnabled()) {
             log.warn("IdempotencyManager not available - executing with lock only");
             return executeWithLock(lockKey, action);
