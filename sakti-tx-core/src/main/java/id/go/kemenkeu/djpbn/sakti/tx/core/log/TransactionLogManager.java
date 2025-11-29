@@ -20,7 +20,7 @@ public class TransactionLogManager {
     
     private static final String LOG_PREFIX = "sakti:txlog:";
     private static final String FAILED_PREFIX = "sakti:txlog:failed:";
-    private static final long DEFAULT_TTL_HOURS = 72; // Keep 3 days
+    private static final long DEFAULT_TTL_HOURS = 24; // Keep 1 days
     
     private final RedissonClient redissonClient;
     private final ObjectMapper objectMapper;
@@ -42,7 +42,7 @@ public class TransactionLogManager {
     public TransactionLog createLog(String businessKey) {
         TransactionLog txLog = new TransactionLog(businessKey);
         saveLog(txLog);
-        log.info("Transaction started: {} (business: {})", txLog.getTxId(), businessKey);
+        log.debug("Transaction started: {} (business: {})", txLog.getTxId(), businessKey);
         return txLog;
     }
     
@@ -96,7 +96,7 @@ public class TransactionLogManager {
         if (txLog != null) {
             txLog.markCommitted();
             saveLog(txLog);
-            log.info("Transaction committed: {}", txId);
+            log.debug("Transaction committed: {}", txId);
             
             // Schedule cleanup after retention period
             scheduleCleanup(txId);
@@ -123,7 +123,7 @@ public class TransactionLogManager {
         if (txLog != null) {
             txLog.markRolledBack();
             saveLog(txLog);
-            log.info("Transaction rolled back: {}", txId);
+            log.debug("Transaction rolled back: {}", txId);
             
             scheduleCleanup(txId);
         }
@@ -168,7 +168,7 @@ public class TransactionLogManager {
                 }
             }
             
-            log.info("Found {} failed transactions", failedTxs.size());
+            log.debug("Found {} failed transactions", failedTxs.size());
             
         } catch (Exception e) {
             log.error("Failed to get failed transactions", e);
@@ -196,7 +196,7 @@ public class TransactionLogManager {
             txLog.incrementRetry();
             txLog.setState(TransactionLog.TransactionState.ROLLING_BACK);
             saveLog(txLog);
-            log.info("Retrying transaction: {} (attempt: {})", 
+            log.debug("Retrying transaction: {} (attempt: {})", 
                 txId, txLog.getRetryCount());
         }
     }
@@ -214,7 +214,7 @@ public class TransactionLogManager {
      */
     public int cleanupOldTransactions(long olderThanHours) {
         // Implementation for manual cleanup if needed
-        log.info("Cleanup old transactions older than {} hours", olderThanHours);
+        log.debug("Cleanup old transactions older than {} hours", olderThanHours);
         return 0;
     }
 }

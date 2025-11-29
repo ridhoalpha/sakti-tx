@@ -66,7 +66,7 @@ public class SaktiDistributedTxAspect {
         String businessKey = generateBusinessKey(pjp);
         TransactionLog txLog = logManager.createLog(businessKey);
         
-        log.info("Distributed transaction started: {} (business: {})", 
+        log.debug("Distributed transaction started: {} (business: {})", 
             txLog.getTxId(), businessKey);
         
         // Setup entity tracking context
@@ -100,7 +100,7 @@ public class SaktiDistributedTxAspect {
             
             commit(txLog);
             
-            log.info("Distributed transaction committed: {} ({} operations)", 
+            log.debug("Distributed transaction committed: {} ({} operations)", 
                 txLog.getTxId(), txLog.getOperations().size());
             
             return result;
