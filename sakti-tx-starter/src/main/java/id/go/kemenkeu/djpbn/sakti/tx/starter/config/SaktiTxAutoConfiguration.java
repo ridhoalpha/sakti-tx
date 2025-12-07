@@ -1,6 +1,8 @@
 package id.go.kemenkeu.djpbn.sakti.tx.starter.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import id.go.kemenkeu.djpbn.sakti.tx.core.cache.CacheManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.compensate.CompensatingTransactionExecutor;
 import id.go.kemenkeu.djpbn.sakti.tx.core.idempotency.IdempotencyManager;
@@ -32,6 +34,7 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.annotation.Order;
 import org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
@@ -62,7 +65,6 @@ public class SaktiTxAutoConfiguration {
 
         if (properties.getMultiDb().isEnabled()) {
             log.info("Setting up automatic entity tracking with JPA listeners");
-            EntityOperationListener.setObjectMapper(objectMapper());
         }
         
         // Validate Dragonfly-dependent features
@@ -112,7 +114,8 @@ public class SaktiTxAutoConfiguration {
                 "endpoints: /admin/transactions/*");
         }
         logFeatureStatus("Distributed Lock", properties.getLock().isEnabled(), 
-            getDependencyStatus(properties.getLock().isEnabled(), properties.getDragonfly().isEnabled()));logFeatureStatus("Cache Manager", properties.getCache().isEnabled(), 
+            getDependencyStatus(properties.getLock().isEnabled(), properties.getDragonfly().isEnabled()));
+        logFeatureStatus("Cache Manager", properties.getCache().isEnabled(), 
             getDependencyStatus(properties.getCache().isEnabled(), properties.getDragonfly().isEnabled()));
         logFeatureStatus("Idempotency", properties.getIdempotency().isEnabled(), 
             getDependencyStatus(properties.getIdempotency().isEnabled(), properties.getDragonfly().isEnabled()));
@@ -145,30 +148,73 @@ public class SaktiTxAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean(ObjectMapper.class)
+    @Order(0)
     public ObjectMapper objectMapper() {
-        log.debug("Creating default ObjectMapper with JSR-310 support");
+        log.info("Creating ObjectMapper with JSR-310 support");
+        
         ObjectMapper mapper = new ObjectMapper();
         
         try {
+            mapper.registerModule(new JavaTimeModule());
+            mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
             mapper.findAndRegisterModules();
-            log.debug("Registered Jackson modules: {}", mapper.getRegisteredModuleIds());
+            log.info("Registered modules: {}", mapper.getRegisteredModuleIds());
+            
+            validateInstantSerialization(mapper);
+            
+            EntityOperationListener.setObjectMapper(mapper);
+            
+            return mapper;
+            
         } catch (Exception e) {
-            log.warn("Could not auto-register Jackson modules - manually registering JavaTimeModule");
-            try {
-                Class<?> javaTimeModule = Class.forName("com.fasterxml.jackson.datatype.jsr310.JavaTimeModule");
-                Object module = javaTimeModule.getDeclaredConstructor().newInstance();
-                mapper.registerModule((com.fasterxml.jackson.databind.Module) module);
-                log.info("Manually registered JavaTimeModule");
-            } catch (Exception ex) {
-                log.error("CRITICAL: Cannot register JavaTimeModule - Instant deserialization will FAIL", ex);
-                throw new IllegalStateException(
-                    "Jackson JSR-310 module not available. Ensure jackson-datatype-jsr310 is in classpath.", 
-                    ex
-                );
-            }
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("CRITICAL ERROR: Failed to configure ObjectMapper");
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("Error: {}", e.getMessage(), e);
+            log.error("");
+            log.error("This will cause ALL transaction logging to FAIL!");
+            log.error("═══════════════════════════════════════════════════════════");
+            throw new IllegalStateException("Cannot configure ObjectMapper for transaction logging", e);
         }
-        
-        return mapper;
+    }
+    
+    /**
+     * Validate that ObjectMapper can serialize/deserialize Instant
+     */
+    private void validateInstantSerialization(ObjectMapper mapper) {
+        try {
+            java.time.Instant now = java.time.Instant.now();
+            
+            String json = mapper.writeValueAsString(now);
+            log.debug("Instant serialization test: {} → {}", now, json);
+            
+            // Test deserialization
+            java.time.Instant parsed = mapper.readValue(json, java.time.Instant.class);
+            log.debug("Instant deserialization test: {} → {}", json, parsed);
+            
+        } catch (Exception e) {
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("CRITICAL: Instant serialization validation FAILED");
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("Error: {}", e.getMessage());
+            log.error("");
+            log.error("Possible causes:");
+            log.error("  1. jackson-datatype-jsr310 not in classpath");
+            log.error("  2. JavaTimeModule not registered properly");
+            log.error("  3. Incompatible Jackson version");
+            log.error("");
+            log.error("Add to pom.xml:");
+            log.error("  <dependency>");
+            log.error("    <groupId>com.fasterxml.jackson.datatype</groupId>");
+            log.error("    <artifactId>jackson-datatype-jsr310</artifactId>");
+            log.error("  </dependency>");
+            log.error("═══════════════════════════════════════════════════════════");
+            
+            throw new IllegalStateException(
+                "ObjectMapper cannot serialize/deserialize Instant - JSR-310 module not working", 
+                e
+            );
+        }
     }
 
     @Bean(destroyMethod = "shutdown")
@@ -313,12 +359,25 @@ public class SaktiTxAutoConfiguration {
 
     @Bean
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
-    @ConditionalOnBean(RedissonClient.class)
+    @ConditionalOnBean({RedissonClient.class, ObjectMapper.class})
     public TransactionLogManager transactionLogManager(
             RedissonClient redissonClient,
             ObjectMapper objectMapper,
             SaktiTxProperties properties) {
+        
         log.info("Creating TransactionLogManager");
+        
+        try {
+            java.time.Instant test = java.time.Instant.now();
+            String json = objectMapper.writeValueAsString(test);
+            objectMapper.readValue(json, java.time.Instant.class);
+            log.debug("✓ ObjectMapper validation passed for TransactionLogManager");
+        } catch (Exception e) {
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("CRITICAL: ObjectMapper validation FAILED in TransactionLogManager {}", e);
+            log.error("═══════════════════════════════════════════════════════════");
+            throw new IllegalStateException("ObjectMapper not properly configured", e);
+        }
         
         boolean waitForSync = properties.getDragonfly().isWaitForSync();
         int waitTimeoutMs = properties.getDragonfly().getWaitForSyncTimeoutMs();
@@ -447,7 +506,7 @@ public class SaktiTxAutoConfiguration {
         log.info("   Admin API endpoints available at: /admin/transactions/*");
         log.info("   WARNING: Ensure proper authentication/authorization is configured");
         return new TransactionAdminController(logManager, compensator, recoveryWorker);
-}
+    }
     
     @Bean
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
@@ -470,16 +529,6 @@ public class SaktiTxAutoConfiguration {
         return new SaktiDistributedTxAspect(properties, logManager, compensator, emMapper, lockManager);
     }
 
-    /**
-     * IMPROVED JMS BEAN CONFIGURATION
-     * 
-     * SCENARIOS HANDLED:
-     * 1. User provides ConnectionFactory bean → use that
-     * 2. User sets broker-url + has artemis-jakarta-client → auto-create
-     * 3. User sets broker-url but NO artemis-jakarta-client → log error + skip
-     * 4. JMS disabled → skip
-     * 5. jakarta.jms NOT in classpath → skip silently
-     */
     @Bean
     @ConditionalOnMissingBean(JmsEventPublisher.class)
     @ConditionalOnProperty(prefix = "sakti.tx.jms", name = "enabled", havingValue = "true")
@@ -495,9 +544,6 @@ public class SaktiTxAutoConfiguration {
         String factorySource = null;
         
         try {
-            // ═══════════════════════════════════════════════════════════════
-            // STEP 1: Check if jakarta.jms.ConnectionFactory exists
-            // ═══════════════════════════════════════════════════════════════
             Class<?> connectionFactoryClass = null;
             try {
                 connectionFactoryClass = Class.forName("jakarta.jms.ConnectionFactory");
