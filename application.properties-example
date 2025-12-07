@@ -29,6 +29,7 @@ sakti.tx.multi-db.log-retention-hours=72
 
 # Rollback retry configuration
 sakti.tx.multi-db.max-retry-attempts=3
+sakti.tx.multi-db.max-rollback-retries=3
 sakti.tx.multi-db.retry-backoff-ms=1000
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -75,68 +76,210 @@ sakti.tx.jms.enabled=false
 # sakti.tx.jms.password=admin
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PRODUCTION CONFIGURATION EXAMPLE
+# DRAGONFLY DURABILITY SETTINGS (NEW - CRITICAL FOR PRODUCTION)
 # ═══════════════════════════════════════════════════════════════════════════
-# For SAKTI application with multi-database setup:
-#
-# Features enabled:
-# ✅ Distributed Transaction (auto-rollback across DBs)
-# ✅ Distributed Lock (prevent concurrent modifications)
-# ✅ Idempotency (prevent duplicate transactions)
-# ✅ Cache (improve read performance)
-# ✅ Circuit Breaker (graceful degradation)
-# ✅ Health Check (monitoring)
-#
-# Features disabled:
-# ❌ JMS (not needed for synchronous transactions)
-#
-# ═══════════════════════════════════════════════════════════════════════════
+# Verify Dragonfly persistence configuration at startup
+# Logs warnings if durability settings are not optimal
+sakti.tx.dragonfly.verify-durability=true
+
+# WAIT for sync after writing transaction log (OPTIONAL - for paranoid mode)
+# When enabled, ensures Redis/Dragonfly syncs to disk before proceeding
+# Trade-off: Higher durability vs slight latency increase (~5-10ms per transaction)
+# Recommendation:
+#   - Development: false (better performance)
+#   - Production (critical data): true (maximum durability)
+sakti.tx.dragonfly.wait-for-sync=false
+sakti.tx.dragonfly.wait-for-sync-timeout-ms=5000
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MONITORING & ALERTING
+# PRODUCTION RECOMMENDATIONS
 # ═══════════════════════════════════════════════════════════════════════════
-# Check failed transactions:
-# GET /admin/transactions/failed
+# For production deployment with critical transactions:
 #
-# Retry failed transaction:
-# POST /admin/transactions/retry/{txId}
+# 1. Enable WAIT-FOR-SYNC (high durability):
+#    sakti.tx.dragonfly.wait-for-sync=true
 #
-# Get transaction details:
-# GET /admin/transactions/{txId}
+# 2. Ensure Dragonfly has snapshot configured:
+#    --snapshot_cron="0 */4 * * *"  (every 4 hours)
+#    --dir=/data  (persistent volume)
+#    --dbfilename=dump
 #
-# Health check:
-# GET /actuator/health
+# 3. Monitor failed transactions:
+#    GET /admin/transactions/failed
+#
+# 4. Set up alerting for partial commits
 #
 # ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# RECOVERY WORKER (NEW - AUTOMATIC STUCK TRANSACTION RECOVERY)
+# ═══════════════════════════════════════════════════════════════════════════
+# Enable background recovery worker untuk automatic recovery of stalled transactions
+# Recommendation: ALWAYS ENABLED in production
+sakti.tx.multi-db.recovery.enabled=true
+
+# Scan interval - how often to scan for stalled transactions
+# Default: 60000ms (1 minute)
+# Recommendation:
+#   - Development: 60000 (1 minute) - frequent checks for testing
+#   - Production: 300000 (5 minutes) - reduce overhead
+sakti.tx.multi-db.recovery.scan-interval-ms=60000
+
+# Initial delay before first scan (allow app to fully start)
+# Default: 30000ms (30 seconds)
+sakti.tx.multi-db.recovery.initial-delay-ms=30000
+
+# Stall timeout - how long before a transaction is considered stalled
+# Default: 300000ms (5 minutes)
+# A transaction is considered stalled if it's in IN_PROGRESS/ROLLING_BACK state
+# for longer than this timeout
+# Recommendation:
+#   - Development: 300000 (5 minutes)
+#   - Production: 600000 (10 minutes) - avoid false positives
+sakti.tx.multi-db.recovery.stall-timeout-ms=300000
+
+# Max recovery attempts before marking as FAILED
+# Default: 5
+# After this many failed recovery attempts, transaction is marked as FAILED
+# and requires manual intervention via admin API
+sakti.tx.multi-db.recovery.max-recovery-attempts=5
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TESTING CONFIGURATIONS
+# ADMIN API (NEW - MANUAL INTERVENTION ENDPOINTS)
 # ═══════════════════════════════════════════════════════════════════════════
+# Enable admin REST API for transaction management
+# Recommendation: ALWAYS ENABLED in production (with proper security)
+sakti.tx.multi-db.admin-api.enabled=true
 
-# --- TEST 1: Minimal (Lock Only) ---
-# sakti.tx.dragonfly.enabled=true
-# sakti.tx.dragonfly.url=redis://localhost:6379
-# sakti.tx.lock.enabled=true
-# sakti.tx.multi-db.enabled=false
-# sakti.tx.cache.enabled=false
-# sakti.tx.idempotency.enabled=false
+# SECURITY WARNING:
+# Admin API endpoints are NOT secured by default!
+# You MUST secure them with Spring Security or similar.
+#
+# Example Spring Security configuration:
+#   http.authorizeHttpRequests()
+#       .requestMatchers("/admin/transactions/**").hasRole("ADMIN")
+#       .anyRequest().authenticated();
+#
+# Available endpoints:
+#   GET    /admin/transactions/failed          - List failed transactions
+#   GET    /admin/transactions/{txId}          - Get transaction details
+#   POST   /admin/transactions/retry/{txId}    - Manual retry rollback
+#   DELETE /admin/transactions/{txId}          - Mark as manually resolved
+#   GET    /admin/transactions/metrics         - Recovery worker metrics
+#   GET    /admin/transactions/health          - Health check
+#   POST   /admin/transactions/force-scan      - Force immediate recovery scan
 
-# --- TEST 2: Full Stack (Recommended for Production) ---
-# sakti.tx.dragonfly.enabled=true
-# sakti.tx.dragonfly.url=redis://dragonfly-ha:6379
-# sakti.tx.multi-db.enabled=true
-# sakti.tx.lock.enabled=true
-# sakti.tx.cache.enabled=true
-# sakti.tx.idempotency.enabled=true
-# sakti.tx.circuit-breaker.enabled=true
-# sakti.tx.health.enabled=true
+# ═══════════════════════════════════════════════════════════════════════════
+# MONITORING & ALERTING SETUP (RECOMMENDED)
+# ═══════════════════════════════════════════════════════════════════════════
+# Set up monitoring untuk failed transactions:
+#
+# 1. Periodic check via cron job:
+#    */5 * * * * curl -s http://localhost:8080/admin/transactions/failed | \
+#                jq -r '.count' | \
+#                awk '{if($1>0) print "ALERT: "$1" failed transactions"}'
+#
+# 2. Prometheus metrics (if using Spring Boot Actuator):
+#    GET /actuator/metrics/sakti.tx.failed.count
+#
+# 3. Log monitoring:
+#    grep "PARTIAL COMMIT" application.log
+#    grep "MANUAL INTERVENTION REQUIRED" application.log
+#
+# 4. Recovery worker metrics:
+#    GET /admin/transactions/metrics
+#    Response:
+#    {
+#      "totalAttempts": 42,
+#      "successful": 40,
+#      "failed": 2,
+#      "successRate": "95.24%",
+#      "lastScanFound": 0,
+#      "lastScanTime": "2025-01-22T10:30:00Z"
+#    }
 
-# --- TEST 3: Distributed Transaction Only (No Lock/Cache) ---
-# sakti.tx.dragonfly.enabled=true
-# sakti.tx.dragonfly.url=redis://localhost:6379
-# sakti.tx.multi-db.enabled=true
-# sakti.tx.lock.enabled=false
-# sakti.tx.cache.enabled=false
-# sakti.tx.idempotency.enabled=false
+# ═══════════════════════════════════════════════════════════════════════════
+# COMPLETE PRODUCTION CONFIGURATION EXAMPLE
+# ═══════════════════════════════════════════════════════════════════════════
+# Full recommended configuration for production deployment:
+
+# Dragonfly with maximum durability
+sakti.tx.dragonfly.enabled=true
+sakti.tx.dragonfly.url=redis://dragonfly-dev.dragonfly-ocpdev.svc.cluster.local:6379
+sakti.tx.dragonfly.password=${DRAGONFLY_PASSWORD}
+sakti.tx.dragonfly.verify-durability=true
+sakti.tx.dragonfly.wait-for-sync=true
+sakti.tx.dragonfly.wait-for-sync-timeout-ms=5000
+
+# Distributed transaction with auto-rollback
+sakti.tx.multi-db.enabled=true
+sakti.tx.multi-db.rollback-strategy=COMPENSATING
+sakti.tx.multi-db.max-rollback-retries=3
+sakti.tx.multi-db.retry-backoff-ms=1000
+
+# Recovery worker (automatic recovery)
+sakti.tx.multi-db.recovery.enabled=true
+sakti.tx.multi-db.recovery.scan-interval-ms=300000
+sakti.tx.multi-db.recovery.stall-timeout-ms=600000
+sakti.tx.multi-db.recovery.max-recovery-attempts=5
+
+# Admin API (manual intervention)
+sakti.tx.multi-db.admin-api.enabled=true
+
+# Distributed lock
+sakti.tx.lock.enabled=true
+sakti.tx.lock.wait-time-ms=5000
+sakti.tx.lock.lease-time-ms=30000
+
+# Idempotency protection
+sakti.tx.idempotency.enabled=true
+sakti.tx.idempotency.ttl-seconds=7200
+
+# Cache
+sakti.tx.cache.enabled=true
+sakti.tx.cache.default-ttl-seconds=600
+
+# Circuit breaker
+sakti.tx.circuit-breaker.enabled=true
+sakti.tx.circuit-breaker.failure-threshold=5
+
+# Health check
+sakti.tx.health.enabled=true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DISASTER RECOVERY PROCEDURES
+# ═══════════════════════════════════════════════════════════════════════════
+# If recovery worker cannot recover a transaction:
+#
+# 1. Check failed transactions:
+#    curl http://localhost:8080/admin/transactions/failed
+#
+# 2. Get transaction details:
+#    curl http://localhost:8080/admin/transactions/{txId}
+#
+# 3. Manual retry:
+#    curl -X POST http://localhost:8080/admin/transactions/retry/{txId}
+#
+# 4. If retry fails repeatedly:
+#    a. Check database state manually
+#    b. Fix data inconsistencies manually
+#    c. Mark transaction as resolved:
+#       curl -X DELETE http://localhost:8080/admin/transactions/{txId}
+#
+# 5. Force immediate recovery scan:
+#    curl -X POST http://localhost:8080/admin/transactions/force-scan
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TESTING CONFIGURATION (DEVELOPMENT)
+# ═══════════════════════════════════════════════════════════════════════════
+# For development/testing with aggressive recovery:
+
+# Fast recovery for testing
+#sakti.tx.multi-db.recovery.enabled=true
+#sakti.tx.multi-db.recovery.scan-interval-ms=30000      # 30 seconds
+#sakti.tx.multi-db.recovery.stall-timeout-ms=120000     # 2 minutes
+#sakti.tx.multi-db.recovery.max-recovery-attempts=3
+
+# Disable wait-for-sync for better performance
+#sakti.tx.dragonfly.wait-for-sync=false
 
 # ═══════════════════════════════════════════════════════════════════════════

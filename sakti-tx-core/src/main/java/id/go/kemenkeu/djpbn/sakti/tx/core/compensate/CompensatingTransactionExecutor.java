@@ -5,6 +5,7 @@ import id.go.kemenkeu.djpbn.sakti.tx.core.log.TransactionLog;
 import id.go.kemenkeu.djpbn.sakti.tx.core.log.TransactionLog.OperationLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.Query;
@@ -13,6 +14,12 @@ import java.util.*;
 
 /**
  * COMPENSATING TRANSACTION EXECUTOR - PRODUCTION VERSION
+ * 
+ * ENHANCED VERSION:
+ * - Better exception propagation (no swallowing)
+ * - Detailed operation-level error logging with MDC
+ * - Retry-safe rollback mechanism
+ * - Clear error messages for debugging
  * 
  * HANDLES ALL SCENARIOS:
  * 1. Entity operations (save, delete)
@@ -50,47 +57,104 @@ public class CompensatingTransactionExecutor {
      * Operations di-rollback dalam REVERSE order
      */
     public void rollback(TransactionLog txLog) {
-        log.warn("Starting rollback for transaction: {}", txLog.getTxId());
+        String txId = txLog.getTxId();
+        MDC.put("txId", txId);
+        
+        log.warn("═══════════════════════════════════════════════════════════");
+        log.warn("Starting rollback for transaction: {}", txId);
+        log.warn("Business Key: {}", txLog.getBusinessKey());
+        log.warn("Total Operations: {}", txLog.getOperations().size());
+        log.warn("═══════════════════════════════════════════════════════════");
         
         List<OperationLog> operations = txLog.getOperationsInReverseOrder();
         int successCount = 0;
         int failureCount = 0;
         int skippedCount = 0;
+        List<String> failedOperations = new ArrayList<>();
         
-        for (OperationLog op : operations) {
-            if (op.isCompensated()) {
-                log.debug("Skip already compensated: {} [id={}]", 
-                    op.getEntityClass(), op.getEntityId());
-                skippedCount++;
-                continue;
-            }
+        for (int i = 0; i < operations.size(); i++) {
+            OperationLog op = operations.get(i);
+            
+            // Set MDC for this specific operation
+            MDC.put("opSequence", String.valueOf(op.getSequence()));
+            MDC.put("opType", op.getOperationType().toString());
             
             try {
+                if (op.isCompensated()) {
+                    log.debug("Skip already compensated: {} [id={}]", 
+                        op.getEntityClass(), op.getEntityId());
+                    skippedCount++;
+                    continue;
+                }
+                
+                log.info("Compensating operation {}/{}: {} {} [id={}] on {}", 
+                    i + 1, operations.size(),
+                    op.getOperationType(), 
+                    op.getEntityClass(), 
+                    op.getEntityId(),
+                    op.getDatasource());
+                
                 compensateOperation(op);
                 op.setCompensated(true);
                 successCount++;
                 
-                log.info(" Compensated: {} {} [id={}]", 
+                log.info("✓ Compensation successful: {} {} [id={}]", 
                     op.getOperationType(), op.getEntityClass(), op.getEntityId());
                 
             } catch (Exception e) {
                 op.setCompensationError(e.getMessage());
                 failureCount++;
                 
-                log.error(" Compensation FAILED: {} {} [id={}] - {}", 
+                String errorDetail = String.format("%s %s [id=%s] on %s: %s",
                     op.getOperationType(), op.getEntityClass(), 
-                    op.getEntityId(), e.getMessage(), e);
+                    op.getEntityId(), op.getDatasource(), e.getMessage());
+                failedOperations.add(errorDetail);
+                
+                log.error("═══════════════════════════════════════════════════════════");
+                log.error("✗ Compensation FAILED for operation {}/{}", i + 1, operations.size());
+                log.error("Operation Type: {}", op.getOperationType());
+                log.error("Entity Class: {}", op.getEntityClass());
+                log.error("Entity ID: {}", op.getEntityId());
+                log.error("Datasource: {}", op.getDatasource());
+                log.error("Error: {}", e.getMessage());
+                log.error("═══════════════════════════════════════════════════════════");
+                log.error("Full stacktrace:", e);
+                
+            } finally {
+                MDC.remove("opSequence");
+                MDC.remove("opType");
             }
         }
         
-        log.warn("Rollback completed: {} success, {} failed, {} skipped", 
-            successCount, failureCount, skippedCount);
+        log.warn("═══════════════════════════════════════════════════════════");
+        log.warn("Rollback Summary for txId: {}", txId);
+        log.warn("Success: {}", successCount);
+        log.warn("Failed: {}", failureCount);
+        log.warn("Skipped: {}", skippedCount);
+        log.warn("═══════════════════════════════════════════════════════════");
+        
+        MDC.remove("txId");
         
         if (failureCount > 0) {
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("PARTIAL ROLLBACK FAILURE DETECTED!");
+            log.error("Transaction: {}", txId);
+            log.error("Failed Operations ({}):", failureCount);
+            for (String detail : failedOperations) {
+                log.error("  - {}", detail);
+            }
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("⚠ MANUAL INTERVENTION MAY BE REQUIRED!");
+            log.error("   Use admin API: POST /admin/transactions/retry/{}", txId);
+            log.error("═══════════════════════════════════════════════════════════");
+            
+            // Don't swallow - throw exception with context
             throw new CompensationException(
-                String.format("Rollback partially failed: %d/%d operations failed", 
-                    failureCount, operations.size()));
+                String.format("Rollback partially failed: %d/%d operations failed for txId %s. Check logs for details.",
+                    failureCount, operations.size(), txId));
         }
+        
+        log.info("✓ Rollback completed successfully for txId: {}", txId);
     }
     
     /**
@@ -131,7 +195,7 @@ public class CompensatingTransactionExecutor {
                 break;
                 
             default:
-                log.warn(" Unknown operation type: {} - skipping", op.getOperationType());
+                log.warn("Unknown operation type: {} - skipping", op.getOperationType());
         }
     }
     
@@ -163,9 +227,10 @@ public class CompensatingTransactionExecutor {
         log.debug("RESTORE updated record: {} [id={}]", op.getEntityClass(), op.getEntityId());
         
         if (op.getSnapshot() == null) {
-            log.error("No snapshot for UPDATE rollback: {} [id={}]", 
+            String error = String.format("No snapshot for UPDATE rollback: %s [id=%s]", 
                 op.getEntityClass(), op.getEntityId());
-            throw new IllegalStateException("Cannot rollback UPDATE without snapshot");
+            log.error(error);
+            throw new IllegalStateException(error);
         }
         
         Class<?> entityClass = Class.forName(op.getEntityClass());
@@ -186,9 +251,10 @@ public class CompensatingTransactionExecutor {
         log.debug("RE-INSERT deleted record: {} [id={}]", op.getEntityClass(), op.getEntityId());
         
         if (op.getSnapshot() == null) {
-            log.error("No snapshot for DELETE rollback: {} [id={}]", 
+            String error = String.format("No snapshot for DELETE rollback: %s [id=%s]", 
                 op.getEntityClass(), op.getEntityId());
-            throw new IllegalStateException("Cannot rollback DELETE without snapshot");
+            log.error(error);
+            throw new IllegalStateException(error);
         }
         
         Class<?> entityClass = Class.forName(op.getEntityClass());
@@ -211,22 +277,19 @@ public class CompensatingTransactionExecutor {
     
     /**
      * Compensate BULK UPDATE
-     * 
-     * Example: UPDATE Account SET balance = balance + 100 WHERE region = 'ASIA'
-     * Compensation: Restore each affected row to snapshot
      */
     private void compensateBulkUpdate(EntityManager em, OperationLog op) throws Exception {
         log.debug("Compensating BULK UPDATE: {}", op.getAdditionalInfo());
         
         if (op.getAffectedEntities() == null || op.getAffectedEntities().isEmpty()) {
-            log.warn(" No affected entities snapshot - cannot compensate bulk update");
-            throw new IllegalStateException("Bulk update compensation requires affected entities snapshot");
+            String error = "Bulk update compensation requires affected entities snapshot";
+            log.error(error);
+            throw new IllegalStateException(error);
         }
         
         Class<?> entityClass = Class.forName(op.getEntityClass());
         int restoredCount = 0;
         
-        // Restore each affected entity
         for (Map<String, Object> snapshot : op.getAffectedEntities()) {
             try {
                 Object entity = objectMapper.convertValue(snapshot, entityClass);
@@ -235,6 +298,7 @@ public class CompensatingTransactionExecutor {
                 restoredCount++;
             } catch (Exception e) {
                 log.error("Failed to restore entity: {}", snapshot, e);
+                // Continue with other entities, throw at end if any failed
             }
         }
         
@@ -244,22 +308,19 @@ public class CompensatingTransactionExecutor {
     
     /**
      * Compensate BULK DELETE
-     * 
-     * Example: DELETE FROM Account WHERE balance = 0
-     * Compensation: Re-insert all deleted rows
      */
     private void compensateBulkDelete(EntityManager em, OperationLog op) throws Exception {
         log.debug("Compensating BULK DELETE: {}", op.getAdditionalInfo());
         
         if (op.getAffectedEntities() == null || op.getAffectedEntities().isEmpty()) {
-            log.warn(" No affected entities snapshot - cannot compensate bulk delete");
-            throw new IllegalStateException("Bulk delete compensation requires affected entities snapshot");
+            String error = "Bulk delete compensation requires affected entities snapshot";
+            log.error(error);
+            throw new IllegalStateException(error);
         }
         
         Class<?> entityClass = Class.forName(op.getEntityClass());
         int reinsertedCount = 0;
         
-        // Re-insert each deleted entity
         for (Map<String, Object> snapshot : op.getAffectedEntities()) {
             try {
                 Object entity = objectMapper.convertValue(snapshot, entityClass);
@@ -277,24 +338,15 @@ public class CompensatingTransactionExecutor {
     
     /**
      * Compensate NATIVE QUERY
-     * 
-     * Examples:
-     * - UPDATE account SET balance = balance + 100 WHERE id = ?
-     * - UPDATE account SET deleted = 1 WHERE id = ? (soft delete)
-     * - INSERT INTO audit_log SELECT * FROM temp_audit
-     * 
-     * Strategy: Execute inverse query or restore from snapshot
      */
     private void compensateNativeQuery(EntityManager em, OperationLog op) throws Exception {
         log.debug("Compensating NATIVE QUERY: {}", op.getAdditionalInfo());
         
-        // Check if inverse query provided
         if (op.getInverseQuery() != null && !op.getInverseQuery().isEmpty()) {
             log.debug("Executing inverse query: {}", op.getInverseQuery());
             
             Query query = em.createNativeQuery(op.getInverseQuery());
             
-            // Bind parameters if any
             if (op.getQueryParameters() != null) {
                 for (Map.Entry<String, Object> param : op.getQueryParameters().entrySet()) {
                     query.setParameter(param.getKey(), param.getValue());
@@ -307,27 +359,18 @@ public class CompensatingTransactionExecutor {
             log.info("Native query compensated: {} rows affected", updated);
             
         } else if (op.getSnapshot() != null) {
-            // Fallback: restore single entity from snapshot
             log.debug("Using snapshot fallback for native query compensation");
             compensateUpdate(em, op);
             
         } else {
-            log.error(" Cannot compensate native query - no inverse query or snapshot");
-            throw new IllegalStateException(
-                "Native query compensation requires inverse query or snapshot");
+            String error = "Native query compensation requires inverse query or snapshot";
+            log.error(error);
+            throw new IllegalStateException(error);
         }
     }
     
     /**
      * Compensate STORED PROCEDURE
-     * 
-     * Examples:
-     * - CALL update_account_balance(?, ?)
-     * - EXEC sp_process_transaction ?
-     * 
-     * Strategy:
-     * 1. Execute inverse procedure if provided
-     * 2. Otherwise restore from snapshot
      */
     private void compensateStoredProcedure(EntityManager em, OperationLog op) throws Exception {
         log.debug("Compensating STORED PROCEDURE: {}", op.getAdditionalInfo());
@@ -335,8 +378,7 @@ public class CompensatingTransactionExecutor {
         if (op.getInverseProcedure() != null && !op.getInverseProcedure().isEmpty()) {
             log.debug("Executing inverse procedure: {}", op.getInverseProcedure());
             
-            Query query = em.createNativeQuery(
-                "CALL " + op.getInverseProcedure());
+            Query query = em.createNativeQuery("CALL " + op.getInverseProcedure());
             
             if (op.getQueryParameters() != null) {
                 for (Map.Entry<String, Object> param : op.getQueryParameters().entrySet()) {
@@ -350,14 +392,13 @@ public class CompensatingTransactionExecutor {
             log.info("Stored procedure compensated");
             
         } else if (op.getAffectedEntities() != null && !op.getAffectedEntities().isEmpty()) {
-            // Restore affected entities
             log.debug("Restoring affected entities for procedure compensation");
             compensateBulkUpdate(em, op);
             
         } else {
-            log.error(" Cannot compensate stored procedure - no inverse procedure or snapshots");
-            throw new IllegalStateException(
-                "Stored procedure compensation requires inverse procedure or affected entities snapshot");
+            String error = "Stored procedure compensation requires inverse procedure or affected entities snapshot";
+            log.error(error);
+            throw new IllegalStateException(error);
         }
     }
     
@@ -369,14 +410,14 @@ public class CompensatingTransactionExecutor {
         
         if (em == null) {
             String available = String.join(", ", entityManagers.keySet());
-            throw new IllegalStateException(
-                String.format(
-                    "No EntityManager found for datasource '%s'. Available datasources: [%s]. " +
-                    "Ensure your EntityManager beans are properly configured with names matching " +
-                    "the datasource identifiers (e.g., 'db1EntityManager', 'db2EntityManager').",
-                    datasource, available
-                )
+            String error = String.format(
+                "No EntityManager found for datasource '%s'. Available datasources: [%s]. " +
+                "Ensure your EntityManager beans are properly configured with names matching " +
+                "the datasource identifiers (e.g., 'db1EntityManager', 'db2EntityManager').",
+                datasource, available
             );
+            log.error(error);
+            throw new IllegalStateException(error);
         }
         
         return em;

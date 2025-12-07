@@ -17,6 +17,11 @@ import java.util.Map;
 /**
  * Hibernate Event Listener untuk automatic tracking
  * Implements Hibernate event interfaces untuk programmatic registration
+ * 
+ * ENHANCED VERSION:
+ * - ThreadLocal cleanup verification
+ * - Better error handling
+ * - Memory leak detection
  */
 public class EntityOperationListener implements 
         PreInsertEventListener,
@@ -43,7 +48,21 @@ public class EntityOperationListener implements
     }
     
     public static void clearContext() {
+        EntityOperationContext ctx = CONTEXT.get();
+        if (ctx != null) {
+            ctx.clear();
+        }
         CONTEXT.remove();
+        
+        // Sanity check - verify it's actually cleared
+        if (CONTEXT.get() != null) {
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("MEMORY LEAK DETECTED: ThreadLocal context was not cleared!");
+            log.error("This can cause cross-request contamination in thread pools");
+            log.error("═══════════════════════════════════════════════════════════");
+            // Force remove
+            CONTEXT.remove();
+        }
     }
     
     // ========================================================================

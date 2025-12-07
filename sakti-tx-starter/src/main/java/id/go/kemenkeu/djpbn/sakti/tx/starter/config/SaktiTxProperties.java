@@ -21,6 +21,9 @@ public class SaktiTxProperties {
         private Pool pool = new Pool();
         private int timeout = 3000;
         private int connectTimeout = 5000;
+        private boolean verifyDurability = true;
+        private boolean waitForSync = false;
+        private int waitForSyncTimeoutMs = 5000;
         
         public static class Pool {
             private int size = 64;
@@ -50,6 +53,19 @@ public class SaktiTxProperties {
         
         public int getConnectTimeout() { return connectTimeout; }
         public void setConnectTimeout(int connectTimeout) { this.connectTimeout = connectTimeout; }
+        
+        public boolean isVerifyDurability() { return verifyDurability; }
+        public void setVerifyDurability(boolean verifyDurability) { 
+            this.verifyDurability = verifyDurability; 
+        }
+        
+        public boolean isWaitForSync() { return waitForSync; }
+        public void setWaitForSync(boolean waitForSync) { this.waitForSync = waitForSync; }
+        
+        public int getWaitForSyncTimeoutMs() { return waitForSyncTimeoutMs; }
+        public void setWaitForSyncTimeoutMs(int waitForSyncTimeoutMs) { 
+            this.waitForSyncTimeoutMs = waitForSyncTimeoutMs; 
+        }
     }
     
     public static class Lock {
@@ -133,7 +149,6 @@ public class SaktiTxProperties {
         private String password = "";
         private long defaultTtlMs = 1800000;
         private String existingFactoryBeanName = "";
-        
         private boolean testOnStartup = true;
         
         public boolean isEnabled() { return enabled; }
@@ -163,12 +178,61 @@ public class SaktiTxProperties {
     public static class MultiDb {
         private boolean enabled = false;
         private RollbackStrategy rollbackStrategy = RollbackStrategy.COMPENSATING;
+        private int maxRollbackRetries = 3;
+        private long rollbackRetryBackoffMs = 1000;
+        private Recovery recovery = new Recovery();
+        private AdminApi adminApi = new AdminApi();
         
         public enum RollbackStrategy {
             COMPENSATING,
             MANUAL
         }
         
+        /**
+         * Recovery worker configuration
+         */
+        public static class Recovery {
+            private boolean enabled = true;
+            private long scanIntervalMs = 60000;      // 1 minute
+            private long initialDelayMs = 30000;      // 30 seconds
+            private long stallTimeoutMs = 300000;     // 5 minutes
+            private int maxRecoveryAttempts = 5;
+            
+            public boolean isEnabled() { return enabled; }
+            public void setEnabled(boolean enabled) { this.enabled = enabled; }
+            
+            public long getScanIntervalMs() { return scanIntervalMs; }
+            public void setScanIntervalMs(long scanIntervalMs) { 
+                this.scanIntervalMs = scanIntervalMs; 
+            }
+            
+            public long getInitialDelayMs() { return initialDelayMs; }
+            public void setInitialDelayMs(long initialDelayMs) { 
+                this.initialDelayMs = initialDelayMs; 
+            }
+            
+            public long getStallTimeoutMs() { return stallTimeoutMs; }
+            public void setStallTimeoutMs(long stallTimeoutMs) { 
+                this.stallTimeoutMs = stallTimeoutMs; 
+            }
+            
+            public int getMaxRecoveryAttempts() { return maxRecoveryAttempts; }
+            public void setMaxRecoveryAttempts(int maxRecoveryAttempts) { 
+                this.maxRecoveryAttempts = maxRecoveryAttempts; 
+            }
+        }
+        
+        /**
+         * Admin API configuration
+         */
+        public static class AdminApi {
+            private boolean enabled = true;
+            
+            public boolean isEnabled() { return enabled; }
+            public void setEnabled(boolean enabled) { this.enabled = enabled; }
+        }
+        
+        // Existing getters and setters
         public boolean isEnabled() { return enabled; }
         public void setEnabled(boolean enabled) { this.enabled = enabled; }
         
@@ -176,6 +240,23 @@ public class SaktiTxProperties {
         public void setRollbackStrategy(RollbackStrategy rollbackStrategy) { 
             this.rollbackStrategy = rollbackStrategy; 
         }
+        
+        public int getMaxRollbackRetries() { return maxRollbackRetries; }
+        public void setMaxRollbackRetries(int maxRollbackRetries) { 
+            this.maxRollbackRetries = maxRollbackRetries; 
+        }
+        
+        public long getRollbackRetryBackoffMs() { return rollbackRetryBackoffMs; }
+        public void setRollbackRetryBackoffMs(long rollbackRetryBackoffMs) { 
+            this.rollbackRetryBackoffMs = rollbackRetryBackoffMs; 
+        }
+        
+        // NEW getters
+        public Recovery getRecovery() { return recovery; }
+        public void setRecovery(Recovery recovery) { this.recovery = recovery; }
+        
+        public AdminApi getAdminApi() { return adminApi; }
+        public void setAdminApi(AdminApi adminApi) { this.adminApi = adminApi; }
     }
     
     public static class Health {

@@ -15,6 +15,7 @@ import org.aspectj.lang.annotation.Aspect;
 import org.aspectj.lang.reflect.MethodSignature;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.annotation.Order;
 import org.springframework.expression.ExpressionParser;
@@ -25,6 +26,16 @@ import org.springframework.stereotype.Component;
 import jakarta.persistence.EntityManager;
 import java.lang.reflect.Method;
 
+/**
+ * ENHANCED Aspect untuk distributed transaction
+ * 
+ * IMPROVEMENTS:
+ * - Full context logging dengan MDC
+ * - Guaranteed ThreadLocal cleanup
+ * - Exponential backoff retry untuk rollback
+ * - Detailed error reporting
+ * - Better exception propagation
+ */
 @Aspect
 @Component
 @Order(0)
@@ -59,32 +70,49 @@ public class SaktiDistributedTxAspect {
             return pjp.proceed();
         }
         
+        // Extract method info
         MethodSignature signature = (MethodSignature) pjp.getSignature();
         Method method = signature.getMethod();
         SaktiDistributedTx annotation = method.getAnnotation(SaktiDistributedTx.class);
         
         String businessKey = generateBusinessKey(pjp);
-        TransactionLog txLog = logManager.createLog(businessKey);
-        
-        log.debug("Distributed transaction started: {} (business: {})", 
-            txLog.getTxId(), businessKey);
-        
-        // Setup entity tracking context
-        EntityOperationListener.EntityOperationContext trackingContext = 
-            new EntityOperationListener.EntityOperationContext(true);
-        EntityOperationListener.setContext(trackingContext);
-        
+        TransactionLog txLog = null;
+        EntityOperationListener.EntityOperationContext trackingContext = null;
         LockManager.LockHandle lock = null;
         
         try {
+            // Initialize transaction log
+            txLog = logManager.createLog(businessKey);
+            String txId = txLog.getTxId();
+            
+            // Set MDC for distributed tracing
+            MDC.put("txId", txId);
+            MDC.put("businessKey", businessKey);
+            
+            log.info("═══════════════════════════════════════════════════════════");
+            log.info("Distributed Transaction STARTED");
+            log.info("Transaction ID: {}", txId);
+            log.info("Business Key: {}", businessKey);
+            log.info("Method: {}.{}", 
+                signature.getDeclaringType().getSimpleName(), 
+                signature.getName());
+            log.info("═══════════════════════════════════════════════════════════");
+            
+            // Setup entity tracking context
+            trackingContext = new EntityOperationListener.EntityOperationContext(true);
+            EntityOperationListener.setContext(trackingContext);
+            
+            // Acquire distributed lock if needed
             if (!annotation.lockKey().isEmpty() && lockManager != null) {
                 String lockKey = evaluateExpression(annotation.lockKey(), pjp);
                 lock = acquireLock(lockKey);
             }
             
+            // Execute business logic
             Object result = pjp.proceed();
             
             // Collect all tracked operations
+            int operationCount = 0;
             for (EntityOperationListener.ConfirmedOperation op : trackingContext.getConfirmedOperations()) {
                 EntityManager em = findEntityManagerForEntity(op.entityClass);
                 String datasource = emMapper.getDatasourceName(em);
@@ -96,33 +124,199 @@ public class SaktiDistributedTxAspect {
                     op.entityId,
                     op.snapshot
                 );
+                operationCount++;
             }
             
+            // Commit transaction
             commit(txLog);
             
-            log.debug("Distributed transaction committed: {} ({} operations)", 
-                txLog.getTxId(), txLog.getOperations().size());
+            log.info("═══════════════════════════════════════════════════════════");
+            log.info("Distributed Transaction COMMITTED");
+            log.info("Transaction ID: {}", txId);
+            log.info("Operations: {}", operationCount);
+            log.info("═══════════════════════════════════════════════════════════");
             
             return result;
             
         } catch (Throwable error) {
-            log.error("Distributed transaction failed: {} - {}", 
-                txLog.getTxId(), error.getMessage());
+            // Enhanced error logging
+            String txId = txLog != null ? txLog.getTxId() : "unknown";
+            int operationCount = txLog != null ? txLog.getOperations().size() : 0;
             
-            rollback(txLog, error);
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("Distributed Transaction FAILED");
+            log.error("Transaction ID: {}", txId);
+            log.error("Business Key: {}", businessKey);
+            log.error("Method: {}.{}", 
+                signature.getDeclaringType().getSimpleName(), 
+                signature.getName());
+            log.error("Operations Recorded: {}", operationCount);
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("Error Type: {}", error.getClass().getName());
+            log.error("Error Message: {}", error.getMessage());
+            log.error("═══════════════════════════════════════════════════════════");
             
-            throw new TransactionRollbackException(
-                "Transaction failed and rolled back: " + error.getMessage(), error);
-            
-        } finally {
-            if (lock != null) {
-                lock.release();
+            // Log each operation for debugging
+            if (txLog != null && !txLog.getOperations().isEmpty()) {
+                log.error("Operations that will be rolled back:");
+                for (TransactionLog.OperationLog op : txLog.getOperations()) {
+                    log.error("  → [{}] {} {} on {} [id={}]",
+                        op.getSequence(),
+                        op.getOperationType(), 
+                        op.getEntityClass(), 
+                        op.getDatasource(), 
+                        op.getEntityId());
+                }
             }
             
-            EntityOperationListener.clearContext();
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("Full stacktrace:", error);
+            log.error("═══════════════════════════════════════════════════════════");
+            
+            // Perform rollback with retry
+            boolean rollbackSuccess = false;
+            if (txLog != null) {
+                rollbackSuccess = rollbackWithRetry(txLog, error);
+            }
+            
+            // Throw enhanced exception with context
+            throw new TransactionRollbackException(
+                String.format("Transaction %s failed and %s: %s. Operations: %d. Original error: %s",
+                    txId,
+                    rollbackSuccess ? "rolled back successfully" : "ROLLBACK FAILED",
+                    rollbackSuccess ? "All changes reverted" : "PARTIAL COMMIT MAY EXIST",
+                    operationCount,
+                    error.getMessage()),
+                error,
+                txId,
+                operationCount,
+                !rollbackSuccess
+            );
+            
+        } finally {
+            // CRITICAL: Guaranteed cleanup
+            log.trace("Cleaning up transaction resources...");
+            
+            // Release lock
+            if (lock != null) {
+                try {
+                    lock.release();
+                    log.trace("Lock released");
+                } catch (Exception e) {
+                    log.error("Failed to release lock", e);
+                }
+            }
+            
+            // Clear entity operation context
+            try {
+                EntityOperationListener.clearContext();
+                log.trace("Entity operation context cleared");
+            } catch (Exception e) {
+                log.error("Failed to clear entity operation context", e);
+            }
+            
+            // Clear MDC
+            MDC.remove("txId");
+            MDC.remove("businessKey");
+            
+            // Sanity check - verify cleanup
+            if (EntityOperationListener.getContext() != null) {
+                log.error("═══════════════════════════════════════════════════════════");
+                log.error("CRITICAL: ThreadLocal context NOT cleared properly!");
+                log.error("This indicates a bug in cleanup logic");
+                log.error("═══════════════════════════════════════════════════════════");
+            }
         }
     }
     
+    /**
+     * Rollback dengan exponential backoff retry
+     * Returns true if rollback successful, false if failed
+     */
+    private boolean rollbackWithRetry(TransactionLog txLog, Throwable originalError) {
+        String txId = txLog.getTxId();
+        int maxAttempts = properties.getMultiDb().getMaxRollbackRetries();
+        long baseBackoffMs = properties.getMultiDb().getRollbackRetryBackoffMs();
+        
+        log.warn("═══════════════════════════════════════════════════════════");
+        log.warn("Starting ROLLBACK with retry (max {} attempts)", maxAttempts);
+        log.warn("Transaction ID: {}", txId);
+        log.warn("Operations to compensate: {}", txLog.getOperations().size());
+        log.warn("═══════════════════════════════════════════════════════════");
+        
+        logManager.markRollingBack(txId, originalError.getMessage());
+        
+        Exception lastException = null;
+        
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                log.info("Rollback attempt {}/{} for txId: {}", attempt, maxAttempts, txId);
+                
+                compensator.rollback(txLog);
+                logManager.markRolledBack(txId);
+                
+                log.info("═══════════════════════════════════════════════════════════");
+                log.info("✓ ROLLBACK SUCCESSFUL on attempt {}/{}", attempt, maxAttempts);
+                log.info("Transaction ID: {}", txId);
+                log.info("All {} operations compensated", txLog.getOperations().size());
+                log.info("═══════════════════════════════════════════════════════════");
+                
+                return true;
+                
+            } catch (Exception e) {
+                lastException = e;
+                
+                log.error("═══════════════════════════════════════════════════════════");
+                log.error("✗ Rollback attempt {}/{} FAILED", attempt, maxAttempts);
+                log.error("Transaction ID: {}", txId);
+                log.error("Error: {}", e.getMessage());
+                log.error("═══════════════════════════════════════════════════════════");
+                
+                if (attempt < maxAttempts) {
+                    long backoffMs = baseBackoffMs * (long) Math.pow(2, attempt - 1);
+                    log.warn("Waiting {}ms before retry attempt {}...", backoffMs, attempt + 1);
+                    
+                    try {
+                        Thread.sleep(backoffMs);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        log.error("Retry sleep interrupted");
+                        break;
+                    }
+                }
+            }
+        }
+        
+        // All retries failed
+        String failureReason = String.format(
+            "Rollback failed after %d attempts. Last error: %s. Original error: %s",
+            maxAttempts,
+            lastException != null ? lastException.getMessage() : "unknown",
+            originalError.getMessage()
+        );
+        
+        logManager.markFailed(txId, failureReason);
+        
+        log.error("═══════════════════════════════════════════════════════════");
+        log.error("⚠ CRITICAL: ROLLBACK FAILED AFTER {} ATTEMPTS", maxAttempts);
+        log.error("Transaction ID: {}", txId);
+        log.error("Operations: {}", txLog.getOperations().size());
+        log.error("═══════════════════════════════════════════════════════════");
+        log.error("⚠ PARTIAL COMMIT MAY EXIST - MANUAL INTERVENTION REQUIRED!");
+        log.error("═══════════════════════════════════════════════════════════");
+        log.error("Actions:");
+        log.error("  1. Check transaction log: {}", txId);
+        log.error("  2. Verify database state manually");
+        log.error("  3. Use admin API to retry: POST /admin/transactions/retry/{}", txId);
+        log.error("  4. Monitor failed transactions: GET /admin/transactions/failed");
+        log.error("═══════════════════════════════════════════════════════════");
+        
+        return false;
+    }
+    
+    /**
+     * Find EntityManager for entity class
+     */
     private EntityManager findEntityManagerForEntity(String entityClassName) {
         try {
             Class<?> entityClass = Class.forName(entityClassName);
@@ -144,64 +338,25 @@ public class SaktiDistributedTxAspect {
         return emMapper.getAllEntityManagers().values().iterator().next();
     }
     
+    /**
+     * Commit transaction
+     */
     private void commit(TransactionLog txLog) {
         try {
             logManager.markCommitted(txLog.getTxId());
         } catch (Exception e) {
-            log.error("Failed to mark transaction as committed", e);
+            log.error("Failed to mark transaction as committed: {}", txLog.getTxId(), e);
         }
     }
     
-    private void rollback(TransactionLog txLog, Throwable originalError) {
-        String txId = txLog.getTxId();
-        
-        try {
-            log.warn("Starting rollback: {} ({} operations to compensate)", 
-                txId, txLog.getOperations().size());
-            
-            logManager.markRollingBack(txId, originalError.getMessage());
-            
-            if (txLog.getOperations().isEmpty()) {
-                log.info("No operations to rollback");
-                logManager.markRolledBack(txId);
-                return;
-            }
-            
-            int maxRetries = 3;
-            Exception lastException = null;
-            
-            for (int attempt = 1; attempt <= maxRetries; attempt++) {
-                try {
-                    log.info("Rollback attempt {}/{}", attempt, maxRetries);
-                    compensator.rollback(txLog);
-                    logManager.markRolledBack(txId);
-                    log.info("Rollback completed successfully on attempt {}", attempt);
-                    return;
-                    
-                } catch (Exception e) {
-                    lastException = e;
-                    log.error("Rollback attempt {} failed: {}", attempt, e.getMessage());
-                    
-                    if (attempt < maxRetries) {
-                        Thread.sleep(1000 * attempt);
-                    }
-                }
-            }
-            
-            log.error("CRITICAL: Rollback failed after {} attempts", maxRetries);
-            logManager.markFailed(txId, "Rollback failed: " + lastException.getMessage());
-            
-        } catch (Exception e) {
-            log.error("CRITICAL: Exception during rollback process", e);
-            logManager.markFailed(txId, "Rollback exception: " + e.getMessage());
-        }
-    }
-    
+    /**
+     * Acquire distributed lock
+     */
     private LockManager.LockHandle acquireLock(String lockKey) throws Exception {
         long waitTime = properties.getLock().getWaitTimeMs();
         long leaseTime = properties.getLock().getLeaseTimeMs();
         
-        log.debug("Acquiring lock: {}", lockKey);
+        log.debug("Acquiring distributed lock: {}", lockKey);
         
         LockManager.LockHandle lock = lockManager.tryLock(lockKey, waitTime, leaseTime);
         
@@ -213,6 +368,9 @@ public class SaktiDistributedTxAspect {
         return lock;
     }
     
+    /**
+     * Generate business key dari method signature
+     */
     private String generateBusinessKey(ProceedingJoinPoint pjp) {
         MethodSignature signature = (MethodSignature) pjp.getSignature();
         String className = signature.getDeclaringType().getSimpleName();
@@ -224,6 +382,9 @@ public class SaktiDistributedTxAspect {
         return String.format("%s.%s(%s)", className, methodName, argInfo);
     }
     
+    /**
+     * Evaluate SpEL expression
+     */
     private String evaluateExpression(String expr, ProceedingJoinPoint pjp) {
         if (expr == null || expr.trim().isEmpty()) {
             return null;

@@ -34,6 +34,7 @@ public class TransactionLog {
     
     public enum TransactionState {
         STARTED,      // Transaction dimulai
+        IN_PROGRESS,  // Sedang diproses
         COMMITTING,   // Sedang commit phase
         COMMITTED,    // Berhasil commit semua
         ROLLING_BACK, // Sedang rollback

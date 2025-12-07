@@ -9,12 +9,14 @@ import id.go.kemenkeu.djpbn.sakti.tx.core.lock.LockManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.lock.RedissonLockManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.log.TransactionLogManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.mapper.EntityManagerDatasourceMapper;
+import id.go.kemenkeu.djpbn.sakti.tx.starter.admin.TransactionAdminController;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.aspect.*;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.event.JmsEventPublisher;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.health.DragonflyHealthIndicator;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.interceptor.ServiceOperationInterceptor;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.service.DistributedLockService;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.service.impl.DistributedLockServiceImpl;
+import id.go.kemenkeu.djpbn.sakti.tx.starter.worker.TransactionRecoveryWorker;
 import jakarta.jms.ConnectionFactory;
 import org.redisson.Redisson;
 import org.redisson.api.RedissonClient;
@@ -31,6 +33,7 @@ import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.persistence.EntityManager;
@@ -38,6 +41,7 @@ import java.util.Map;
 
 @Configuration
 @EnableConfigurationProperties(SaktiTxProperties.class)
+@EnableScheduling
 public class SaktiTxAutoConfiguration {
 
     private static final Logger log = LoggerFactory.getLogger(SaktiTxAutoConfiguration.class);
@@ -97,6 +101,16 @@ public class SaktiTxAutoConfiguration {
             properties.getDragonfly().isEnabled() ? maskUrl(properties.getDragonfly().getUrl()) : "disabled");
         logFeatureStatus("Distributed Transaction", properties.getMultiDb().isEnabled(), 
             properties.getMultiDb().getRollbackStrategy().toString());
+        if (properties.getMultiDb().isEnabled()) {
+            logFeatureStatus("  → Recovery Worker", 
+                properties.getMultiDb().getRecovery().isEnabled(),
+                String.format("scan=%dms, timeout=%dms", 
+                    properties.getMultiDb().getRecovery().getScanIntervalMs(),
+                    properties.getMultiDb().getRecovery().getStallTimeoutMs()));
+            logFeatureStatus("  → Admin API", 
+                properties.getMultiDb().getAdminApi().isEnabled(),
+                "endpoints: /admin/transactions/*");
+        }
         logFeatureStatus("Distributed Lock", properties.getLock().isEnabled(), 
             getDependencyStatus(properties.getLock().isEnabled(), properties.getDragonfly().isEnabled()));logFeatureStatus("Cache Manager", properties.getCache().isEnabled(), 
             getDependencyStatus(properties.getCache().isEnabled(), properties.getDragonfly().isEnabled()));
@@ -281,9 +295,32 @@ public class SaktiTxAutoConfiguration {
     @ConditionalOnBean(RedissonClient.class)
     public TransactionLogManager transactionLogManager(
             RedissonClient redissonClient,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            SaktiTxProperties properties) {
         log.info("Creating TransactionLogManager");
-        return new TransactionLogManager(redissonClient, objectMapper);
+        
+        boolean waitForSync = properties.getDragonfly().isWaitForSync();
+        int waitTimeoutMs = properties.getDragonfly().getWaitForSyncTimeoutMs();
+        
+        if (waitForSync) {
+            log.info("   WAIT-FOR-SYNC: ENABLED (timeout: {}ms)", waitTimeoutMs);
+            log.info("   Transaction logs will wait for disk sync (higher durability, slight latency)");
+        } else {
+            log.info("   WAIT-FOR-SYNC: DISABLED (better performance, lower durability guarantee)");
+            log.info("   Enable with: sakti.tx.dragonfly.wait-for-sync=true");
+        }
+        
+        return new TransactionLogManager(redissonClient, objectMapper, waitForSync, waitTimeoutMs);
+    }
+    
+    @Bean
+    @ConditionalOnProperty(prefix = "sakti.tx.dragonfly", name = "verify-durability", havingValue = "true", matchIfMissing = true)
+    @ConditionalOnBean(RedissonClient.class)
+    public RedisDurabilityVerifier redisDurabilityVerifier(
+            RedissonClient redissonClient,
+            SaktiTxProperties properties) {
+        log.info("Creating RedisDurabilityVerifier");
+        return new RedisDurabilityVerifier(redissonClient, properties);
     }
     
     @Bean
@@ -363,6 +400,33 @@ public class SaktiTxAutoConfiguration {
         
         return new CompensatingTransactionExecutor(entityManagers, objectMapper);
     }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "sakti.tx.multi-db.recovery", name = "enabled", havingValue = "true", matchIfMissing = true)
+    @ConditionalOnBean({TransactionLogManager.class, CompensatingTransactionExecutor.class})
+    public TransactionRecoveryWorker transactionRecoveryWorker(
+            TransactionLogManager logManager,
+            CompensatingTransactionExecutor compensator,
+            SaktiTxProperties properties) {
+        log.info("Creating TransactionRecoveryWorker");
+        log.info("   Scan Interval: {}ms", properties.getMultiDb().getRecovery().getScanIntervalMs());
+        log.info("   Stall Timeout: {}ms", properties.getMultiDb().getRecovery().getStallTimeoutMs());
+        log.info("   Max Recovery Attempts: {}", properties.getMultiDb().getRecovery().getMaxRecoveryAttempts());
+        return new TransactionRecoveryWorker(logManager, compensator, properties);
+    }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "sakti.tx.multi-db.admin-api", name = "enabled", havingValue = "true", matchIfMissing = true)
+    @ConditionalOnBean({TransactionLogManager.class, CompensatingTransactionExecutor.class, TransactionRecoveryWorker.class})
+    public TransactionAdminController transactionAdminController(
+            TransactionLogManager logManager,
+            CompensatingTransactionExecutor compensator,
+            TransactionRecoveryWorker recoveryWorker) {
+        log.info("Creating TransactionAdminController");
+        log.info("   Admin API endpoints available at: /admin/transactions/*");
+        log.info("   WARNING: Ensure proper authentication/authorization is configured");
+        return new TransactionAdminController(logManager, compensator, recoveryWorker);
+}
     
     @Bean
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
