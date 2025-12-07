@@ -50,25 +50,39 @@ public class SaktiCacheAspect {
         Method method = signature.getMethod();
         SaktiCache annotation = method.getAnnotation(SaktiCache.class);
         
+        if (annotation == null) {
+            log.warn("SaktiCache annotation not found on method - executing without cache");
+            return pjp.proceed();
+        }
+        
         StandardEvaluationContext context = createSpelContext(pjp);
         String cacheKey = evaluateExpression(annotation.key(), context, 
             properties.getCache().getPrefix() + method.getName());
         
+        if (cacheKey == null || cacheKey.trim().isEmpty()) {
+            log.warn("Cache key evaluated to null/empty - executing without cache");
+            return pjp.proceed();
+        }
+        
         Object cached = null;
         
-        if (annotation.returnType() != Object.class) {
-            log.debug("Using explicit returnType: {}", annotation.returnType().getSimpleName());
-            cached = saktiCacheManager.get(cacheKey, annotation.returnType());
-        } else {
-            log.debug("Auto-detecting return type from method signature");
-            Type genericReturnType = method.getGenericReturnType();
-            TypeReference<Object> typeRef = new TypeReference<Object>() {
-                @Override
-                public Type getType() {
-                    return genericReturnType;
-                }
-            };
-            cached = saktiCacheManager.get(cacheKey, typeRef);
+        try {
+            if (annotation.returnType() != Object.class) {
+                log.debug("Using explicit returnType: {}", annotation.returnType().getSimpleName());
+                cached = saktiCacheManager.get(cacheKey, annotation.returnType());
+            } else {
+                log.debug("Auto-detecting return type from method signature");
+                Type genericReturnType = method.getGenericReturnType();
+                TypeReference<Object> typeRef = new TypeReference<Object>() {
+                    @Override
+                    public Type getType() {
+                        return genericReturnType;
+                    }
+                };
+                cached = saktiCacheManager.get(cacheKey, typeRef);
+            }
+        } catch (Exception e) {
+            log.warn("Cache retrieval failed for key: {} - {}", cacheKey, e.getMessage());
         }
         
         if (cached != null) {
@@ -80,9 +94,13 @@ public class SaktiCacheAspect {
         Object result = pjp.proceed();
         
         if (result != null) {
-            long ttl = annotation.ttlSeconds() > 0 ? 
-                annotation.ttlSeconds() : properties.getCache().getDefaultTtlSeconds();
-            saktiCacheManager.put(cacheKey, result, ttl);
+            try {
+                long ttl = annotation.ttlSeconds() > 0 ? 
+                    annotation.ttlSeconds() : properties.getCache().getDefaultTtlSeconds();
+                saktiCacheManager.put(cacheKey, result, ttl);
+            } catch (Exception e) {
+                log.warn("Cache storage failed for key: {} - {}", cacheKey, e.getMessage());
+            }
         }
         
         return result;

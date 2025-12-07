@@ -39,6 +39,11 @@
             <artifactId>jackson-core</artifactId>
         </dependency>
         
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
+        
         <!-- SLF4J API only (no implementation) -->
         <dependency>
             <groupId>org.slf4j</groupId>

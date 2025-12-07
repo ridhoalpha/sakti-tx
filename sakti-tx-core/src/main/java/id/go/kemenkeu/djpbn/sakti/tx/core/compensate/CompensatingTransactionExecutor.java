@@ -214,6 +214,10 @@ public class CompensatingTransactionExecutor {
             return;
         }
         
+        if (!em.contains(entity)) {
+            entity = em.merge(entity);
+        }
+        
         em.remove(entity);
         em.flush();
         

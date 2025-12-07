@@ -146,8 +146,29 @@ public class SaktiTxAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean(ObjectMapper.class)
     public ObjectMapper objectMapper() {
-        log.debug("Creating default ObjectMapper");
-        return new ObjectMapper();
+        log.debug("Creating default ObjectMapper with JSR-310 support");
+        ObjectMapper mapper = new ObjectMapper();
+        
+        try {
+            mapper.findAndRegisterModules();
+            log.debug("Registered Jackson modules: {}", mapper.getRegisteredModuleIds());
+        } catch (Exception e) {
+            log.warn("Could not auto-register Jackson modules - manually registering JavaTimeModule");
+            try {
+                Class<?> javaTimeModule = Class.forName("com.fasterxml.jackson.datatype.jsr310.JavaTimeModule");
+                Object module = javaTimeModule.getDeclaredConstructor().newInstance();
+                mapper.registerModule((com.fasterxml.jackson.databind.Module) module);
+                log.info("Manually registered JavaTimeModule");
+            } catch (Exception ex) {
+                log.error("CRITICAL: Cannot register JavaTimeModule - Instant deserialization will FAIL", ex);
+                throw new IllegalStateException(
+                    "Jackson JSR-310 module not available. Ensure jackson-datatype-jsr310 is in classpath.", 
+                    ex
+                );
+            }
+        }
+        
+        return mapper;
     }
 
     @Bean(destroyMethod = "shutdown")

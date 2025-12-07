@@ -2,6 +2,8 @@ package id.go.kemenkeu.djpbn.sakti.tx.core.log;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -214,9 +216,10 @@ public class TransactionLog {
      */
     public String toJson(ObjectMapper mapper) {
         try {
+            ensureJsr310Module(mapper);
             return mapper.writeValueAsString(this);
         } catch (Exception e) {
-            throw new RuntimeException("Failed to serialize transaction log", e);
+            throw new RuntimeException("Failed to serialize transaction log: " + e.getMessage(), e);
         }
     }
     
@@ -225,9 +228,27 @@ public class TransactionLog {
      */
     public static TransactionLog fromJson(String json, ObjectMapper mapper) {
         try {
+            // Ensure JSR-310 module is registered for Instant/LocalDateTime support
+            ensureJsr310Module(mapper);
             return mapper.readValue(json, TransactionLog.class);
         } catch (Exception e) {
-            throw new RuntimeException("Failed to deserialize transaction log", e);
+            throw new RuntimeException("Failed to deserialize transaction log: " + e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * Ensure ObjectMapper has JavaTimeModule registered
+     */
+    private static void ensureJsr310Module(ObjectMapper mapper) {
+        // Check if JavaTimeModule already registered
+        boolean hasModule = mapper.getRegisteredModuleIds().stream()
+            .anyMatch(id -> ((String) id).contains("JavaTimeModule") || ((String) id).contains("jsr310"));
+        
+        if (!hasModule) {
+            // Register JavaTimeModule
+            mapper.registerModule(new JavaTimeModule());
+            // Disable timestamp serialization (use ISO-8601 strings instead)
+            mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
         }
     }
     

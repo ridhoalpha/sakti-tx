@@ -33,9 +33,11 @@ public class EntityListenerRegistrar implements BeanPostProcessor {
                 EntityManagerFactory emf = emfBean.getObject();
                 if (emf != null) {
                     registerHibernateListeners(emf, beanName);
+                } else {
+                    log.warn("EntityManagerFactory is null for bean: {}", beanName);
                 }
             } catch (Exception e) {
-                log.warn("Could not register entity listeners for: {}", beanName, e);
+                log.warn("Could not register entity listeners for: {} - {}", beanName, e.getMessage());
             }
         }
         
@@ -50,7 +52,7 @@ public class EntityListenerRegistrar implements BeanPostProcessor {
                 .getServiceRegistry()
                 .getService(EventListenerRegistry.class);
             
-            // Create single listener instance
+            // Create single listener instance per EntityManagerFactory
             EntityOperationListener listener = new EntityOperationListener();
             
             // Register for all entity events
@@ -66,10 +68,15 @@ public class EntityListenerRegistrar implements BeanPostProcessor {
             log.info("✓ Registered EntityOperationListener for {} entities in {} (via Hibernate Event System)", 
                 entityCount, beanName);
             
-        } catch (Exception e) {
-            log.error("✗ Failed to register Hibernate listeners for: {}", beanName, e);
-            log.error("  Automatic tracking will NOT work for this EntityManager!");
+        } catch (ClassCastException e) {
+            log.error("✗ Cannot unwrap EntityManagerFactory to Hibernate SessionFactory for: {}", beanName);
+            log.error("  JPA provider may not be Hibernate. Automatic tracking will NOT work.");
             log.error("  Ensure Hibernate is used as JPA provider.");
+            
+        } catch (Exception e) {
+            log.error("✗ Failed to register Hibernate listeners for: {} - {}", beanName, e.getMessage());
+            log.error("  Automatic tracking will NOT work for this EntityManager!");
+            log.error("  Error details: {}", e.getClass().getName());
         }
     }
 }

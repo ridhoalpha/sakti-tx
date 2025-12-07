@@ -125,10 +125,6 @@ public class EntityOperationListener implements
         }
     }
     
-    public boolean requiresPostCommitHanding(EntityPersister persister) {
-        return false;
-    }
-    
     // ========================================================================
     // DELETE Events
     // ========================================================================

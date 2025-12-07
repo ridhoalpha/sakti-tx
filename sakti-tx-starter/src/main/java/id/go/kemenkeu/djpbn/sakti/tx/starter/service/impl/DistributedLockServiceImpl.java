@@ -45,7 +45,9 @@ public class DistributedLockServiceImpl implements DistributedLockService {
     @Override
     public <T> T executeWithLock(String lockKey, long waitTimeMs, long leaseTimeMs, 
                                 Supplier<T> action) throws Exception {
-        if (!properties.getLock().isEnabled() || healthIndicator.isCircuitOpen()) {
+        boolean circuitOpen = healthIndicator != null && healthIndicator.isCircuitOpen();
+        
+        if (!properties.getLock().isEnabled() || circuitOpen) {
             log.warn("Lock disabled or circuit open - executing without lock: {}", lockKey);
             return action.get();
         }
@@ -82,7 +84,10 @@ public class DistributedLockServiceImpl implements DistributedLockService {
             return executeWithLock(lockKey, action);
         }
         
-        if (!properties.getLock().isEnabled() || healthIndicator.isCircuitOpen()) {
+        // Check if circuit is open
+        boolean circuitOpen = healthIndicator != null && healthIndicator.isCircuitOpen();
+        
+        if (!properties.getLock().isEnabled() || circuitOpen) {
             log.warn("Lock disabled or circuit open - executing without protection");
             return action.get();
         }

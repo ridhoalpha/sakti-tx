@@ -48,16 +48,54 @@ public class TransactionLogManager {
         if (objectMapper == null) {
             throw new IllegalArgumentException("ObjectMapper cannot be null");
         }
+        
         this.redissonClient = redissonClient;
         this.objectMapper = objectMapper;
         this.waitForSync = waitForSync;
         this.waitForSyncTimeoutMs = waitForSyncTimeoutMs;
+        
+        // CRITICAL: Ensure ObjectMapper can handle Instant/LocalDateTime
+        validateObjectMapper(objectMapper);
         
         if (waitForSync) {
             log.info("TransactionLogManager initialized with WAIT-FOR-SYNC enabled (timeout: {}ms)", 
                 waitForSyncTimeoutMs);
         } else {
             log.info("TransactionLogManager initialized (WAIT-FOR-SYNC disabled)");
+        }
+    }
+    
+    /**
+     * Validate ObjectMapper has JSR-310 support
+     */
+    private void validateObjectMapper(ObjectMapper mapper) {
+        try {
+            // Test serialization/deserialization of Instant
+            Instant now = Instant.now();
+            String json = mapper.writeValueAsString(now);
+            Instant parsed = mapper.readValue(json, Instant.class);
+            
+            log.debug("ObjectMapper JSR-310 validation successful");
+            
+        } catch (Exception e) {
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("CRITICAL ERROR: ObjectMapper cannot serialize/deserialize Instant");
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("This will cause ALL transaction logging to FAIL");
+            log.error("Error: {}", e.getMessage());
+            log.error("");
+            log.error("Solution:");
+            log.error("  1. Ensure jackson-datatype-jsr310 is in classpath");
+            log.error("  2. Register JavaTimeModule:");
+            log.error("     mapper.registerModule(new JavaTimeModule());");
+            log.error("  OR");
+            log.error("     mapper.findAndRegisterModules();");
+            log.error("═══════════════════════════════════════════════════════════");
+            
+            throw new IllegalStateException(
+                "ObjectMapper cannot handle Instant - JSR-310 module not registered", 
+                e
+            );
         }
     }
     
@@ -336,11 +374,27 @@ public class TransactionLogManager {
                     RBucket<String> bucket = redissonClient.getBucket(key);
                     String json = bucket.get();
                     
-                    if (json == null) {
+                    if (json == null || json.trim().isEmpty()) {
+                        log.debug("Empty transaction log for key: {} - skipping", key);
                         continue;
                     }
                     
-                    TransactionLog txLog = TransactionLog.fromJson(json, objectMapper);
+                    TransactionLog txLog = null;
+                    try {
+                        txLog = TransactionLog.fromJson(json, objectMapper);
+                    } catch (Exception e) {
+                        log.error("Failed to deserialize transaction log for key: {} - {}", 
+                            key, e.getMessage());
+                        // Skip this transaction log - it's corrupted
+                        continue;
+                    }
+                    
+                    // Validate txLog has required fields
+                    if (txLog.getState() == null || txLog.getStartTime() == null) {
+                        log.warn("Invalid transaction log (missing state or startTime): {} - skipping", 
+                            txLog.getTxId());
+                        continue;
+                    }
                     
                     // Check if transaction is in problematic state
                     boolean isStalled = false;
@@ -348,7 +402,6 @@ public class TransactionLogManager {
                     switch (txLog.getState()) {
                         case STARTED:
                         case IN_PROGRESS:
-                            // Transaction started but never completed
                             if (txLog.getStartTime().isBefore(cutoffTime)) {
                                 isStalled = true;
                                 log.debug("Found stalled transaction (STARTED): {} age={}s",
@@ -358,7 +411,6 @@ public class TransactionLogManager {
                             break;
                             
                         case ROLLING_BACK:
-                            // Rollback started but never completed
                             if (txLog.getStartTime().isBefore(cutoffTime)) {
                                 isStalled = true;
                                 log.debug("Found stalled transaction (ROLLING_BACK): {} age={}s",
@@ -368,7 +420,6 @@ public class TransactionLogManager {
                             break;
                             
                         case COMMITTING:
-                            // This is critical - commit in progress but stuck
                             if (txLog.getStartTime().isBefore(cutoffTime)) {
                                 isStalled = true;
                                 log.warn("Found stalled transaction (COMMITTING): {} age={}s - CRITICAL",
@@ -378,7 +429,6 @@ public class TransactionLogManager {
                             break;
                             
                         default:
-                            // Other states (COMMITTED, ROLLED_BACK, FAILED) are final
                             break;
                     }
                     
@@ -387,7 +437,8 @@ public class TransactionLogManager {
                     }
                     
                 } catch (Exception e) {
-                    log.error("Error processing transaction log key: {}", key, e);
+                    log.error("Error processing transaction log key: {} - {}", key, e.getMessage());
+                    // Continue with next transaction
                 }
             }
             
