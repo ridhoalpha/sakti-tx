@@ -78,8 +78,18 @@ public class CacheManager {
             
             log.debug("Cache miss: {}", key);
             return null;
+            
         } catch (Exception e) {
-            log.error("Failed to get cache: {}", key, e);
+            log.error("Failed to get cache: {} - EVICTING corrupt cache", key, e);
+            
+            // AUTO-EVICT corrupt cache
+            try {
+                evict(key);
+                log.info("Evicted corrupt cache: {}", key);
+            } catch (Exception evictError) {
+                log.error("Failed to evict corrupt cache: {}", key, evictError);
+            }
+            
             return null;
         }
     }
