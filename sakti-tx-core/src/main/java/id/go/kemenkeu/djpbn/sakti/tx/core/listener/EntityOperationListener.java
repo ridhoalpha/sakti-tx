@@ -65,76 +65,81 @@ public class EntityOperationListener implements
     }
     
     /**
-     * ENHANCED: Multi-strategy cleanup dengan verification
+     * ENHANCED: Multi-strategy cleanup dengan GUARANTEED removal
+     * 
+     * Location: EntityOperationListener.java, line ~90
+     * REPLACE existing clearContext() method with this!
      */
     public static void clearContext() {
+        long threadId = Thread.currentThread().getId();
+        
         try {
-            // Strategy 1: Get current context and mark as cleared
+            // Strategy 1: Get and clear context
             WeakReference<EntityOperationContext> ref = CONTEXT.get();
             if (ref != null) {
                 EntityOperationContext ctx = ref.get();
                 if (ctx != null) {
                     ctx.clear();
-                    log.trace("Context data cleared - thread: {}", Thread.currentThread().getId());
+                    log.trace("Context data cleared - thread: {}", threadId);
                 }
             }
             
-            // Strategy 2: Remove ThreadLocal
+            // Strategy 2: Remove ThreadLocal (PRIMARY CLEANUP)
             CONTEXT.remove();
-            log.trace("ThreadLocal.remove() called - thread: {}", Thread.currentThread().getId());
+            log.trace("ThreadLocal.remove() called - thread: {}", threadId);
             
-            // Strategy 3: CRITICAL VERIFICATION - ensure cleanup worked
+            // Strategy 3: CRITICAL VERIFICATION - MUST CHECK!
             WeakReference<EntityOperationContext> afterRemove = CONTEXT.get();
             
             if (afterRemove != null) {
                 EntityOperationContext afterCtx = afterRemove.get();
                 
                 if (afterCtx != null && !afterCtx.isCleared()) {
+                    // ❌ CLEANUP FAILED - This should NEVER happen!
                     log.error("================================================================");
                     log.error("CRITICAL: ThreadLocal NOT cleared after remove()!");
-                    log.error("Thread: {} ({})", 
-                        Thread.currentThread().getId(),
-                        Thread.currentThread().getName());
+                    log.error("Thread: {} ({})", threadId, Thread.currentThread().getName());
                     log.error("================================================================");
                     
-                    // Strategy 4: Force clear and remove again
-                    afterCtx.clear();
-                    CONTEXT.remove();
-                    CONTEXT.set(null);
-                    CONTEXT.remove();
+                    // Strategy 4: Force clear + multiple remove attempts
+                    afterCtx.forceClear();  // Clear data first
+                    CONTEXT.remove();        // Remove again
+                    CONTEXT.set(null);       // Set to null explicitly
+                    CONTEXT.remove();        // Remove one more time
                     
-                    // Strategy 5: Final verification
+                    // Strategy 5: FINAL VERIFICATION
                     WeakReference<EntityOperationContext> finalCheck = CONTEXT.get();
                     if (finalCheck != null) {
                         EntityOperationContext finalCtx = finalCheck.get();
                         if (finalCtx != null && !finalCtx.isCleared()) {
+                            // ❌❌ STILL FAILED!
                             log.error("================================================================");
                             log.error("FATAL: Cannot clear ThreadLocal after multiple attempts!");
-                            log.error("Thread: {} ({})", 
-                                Thread.currentThread().getId(),
-                                Thread.currentThread().getName());
+                            log.error("Thread: {} ({})", threadId, Thread.currentThread().getName());
                             log.error("This indicates JVM ThreadLocal implementation issue");
                             log.error("================================================================");
                             
-                            // Last resort - force clear data at least
+                            // Last resort - at least clear the data
                             finalCtx.forceClear();
+                        } else {
+                            log.info("ThreadLocal cleared successfully after retry - thread: {}", threadId);
                         }
                     } else {
-                        log.info("ThreadLocal cleared successfully after retry - thread: {}", 
-                            Thread.currentThread().getId());
+                        log.info("ThreadLocal cleared successfully after retry - thread: {}", threadId);
                     }
                 }
             } else {
-                log.trace("ThreadLocal cleared successfully - thread: {}", 
-                    Thread.currentThread().getId());
+                // ✅ SUCCESS - Context properly cleared
+                log.trace("ThreadLocal cleared successfully (first attempt) - thread: {}", threadId);
             }
             
         } catch (Exception e) {
-            log.error("Exception during clearContext - thread: {}", 
-                Thread.currentThread().getId(), e);
+            log.error("Exception during clearContext - thread: {}", threadId, e);
             
-            // Emergency cleanup
+            // Emergency cleanup - try everything
             try {
+                CONTEXT.set(null);
+                CONTEXT.remove();
                 CONTEXT.set(null);
                 CONTEXT.remove();
             } catch (Exception ex) {

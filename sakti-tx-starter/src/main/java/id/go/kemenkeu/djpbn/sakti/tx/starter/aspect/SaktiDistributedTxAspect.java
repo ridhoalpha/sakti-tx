@@ -80,8 +80,6 @@ public class SaktiDistributedTxAspect {
             return pjp.proceed();
         }
         
-        boolean contextCreatedByUs = false;
-        
         TransactionLog txLog = null;
         EntityOperationListener.EntityOperationContext trackingContext = null;
         LockManager.LockHandle lock = null;
@@ -128,7 +126,6 @@ public class SaktiDistributedTxAspect {
             
             trackingContext = new EntityOperationListener.EntityOperationContext(true);
             EntityOperationListener.setContext(trackingContext);
-            contextCreatedByUs = true;
             
             log.debug("Entity tracking context initialized - thread: {}", 
                 Thread.currentThread().getId());
@@ -255,126 +252,190 @@ public class SaktiDistributedTxAspect {
             // ═══════════════════════════════════════════════════════════════
             
             // This MUST execute no matter what!
-            guaranteedCleanup(lock, contextCreatedByUs, txId);
+            ultimateCleanup(lock, txId);
         }
     }
     
     /**
-     * ULTIMATE FIX: Single point cleanup dengan verification
+     * ═══════════════════════════════════════════════════════════════════════════
+     * ULTIMATE CLEANUP: 100% Guaranteed, No Dependencies, No Conditions
+     * ═══════════════════════════════════════════════════════════════════════════
+     * 
+     * REPLACE existing guaranteedCleanup() method with this method!
+     * 
+     * Location: SaktiDistributedTxAspect.java, line ~281
+     * 
+     * PRINCIPLES:
+     * 1. NO flags/conditions - ALWAYS cleanup everything
+     * 2. Detection INDEPENDENT of creation tracking  
+     * 3. Multiple strategies (defense in depth)
+     * 4. Verification after each step
+     * 5. Emergency fallback if all else fails
      */
-    private void guaranteedCleanup(LockManager.LockHandle lock, 
-                                   boolean contextCreatedByUs, 
-                                   String txId) {
+    private void ultimateCleanup(LockManager.LockHandle lock, String txId) {
         
         long threadId = Thread.currentThread().getId();
         String threadName = Thread.currentThread().getName();
         
-        log.trace("=== CLEANUP START === Thread: {} ({})", threadId, threadName);
+        log.trace("════════════════════════════════════════════════════════════");
+        log.trace("ULTIMATE CLEANUP START - Thread: {} ({})", threadId, threadName);
+        log.trace("════════════════════════════════════════════════════════════");
         
+        // ═══════════════════════════════════════════════════════════════
+        // STEP 1: Release Lock (if exists)
+        // ═══════════════════════════════════════════════════════════════
         try {
-            // Step 1: Release lock
             if (lock != null) {
-                try {
-                    lock.release();
-                    log.trace("  [1/4] Lock released");
-                } catch (Exception e) {
-                    log.error("  [1/4] Lock release failed", e);
-                }
+                lock.release();
+                log.trace("  [1/4] ✓ Lock released");
             } else {
-                log.trace("  [1/4] No lock to release");
+                log.trace("  [1/4] - No lock to release");
             }
-            
-            // Step 2: Clear entity operation context (MOST CRITICAL!)
-            if (contextCreatedByUs) {
-                try {
-                    // Get context before clearing
-                    EntityOperationListener.EntityOperationContext ctx = 
-                        EntityOperationListener.getContext();
-                    
-                    if (ctx != null) {
-                        log.trace("  [2/4] Clearing EntityOperationContext...");
-                        
-                        // Strategy 1: Normal clear
-                        EntityOperationListener.clearContext();
-                        
-                        // Strategy 2: Verify immediately
-                        EntityOperationListener.EntityOperationContext afterClear = 
-                            EntityOperationListener.getContext();
-                        
-                        if (afterClear != null) {
-                            log.error("================================================================");
-                            log.error("  [2/4] CRITICAL: Context still exists after clearContext()!");
-                            log.error("  Thread: {} ({})", threadId, threadName);
-                            log.error("  TxId: {}", txId);
-                            log.error("================================================================");
-                            
-                            // Strategy 3: Force clear via forceClear()
-                            if (afterClear.isCleared()) {
-                                // Context marked as cleared but reference still exists
-                                log.warn("  Context marked as cleared but reference exists - removing...");
-                                EntityOperationListener.setContext(null);
-                            } else {
-                                // Context not cleared - force it
-                                log.warn("  Context not cleared - forcing...");
-                                afterClear.forceClear();
-                                EntityOperationListener.setContext(null);
-                            }
-                            
-                            EntityOperationListener.clearContext();
-                            
-                            // Strategy 4: Final check
-                            EntityOperationListener.EntityOperationContext finalCheck = 
-                                EntityOperationListener.getContext();
-                            
-                            if (finalCheck != null) {
-                                log.error("================================================================");
-                                log.error("  [2/4] FATAL: Cannot clear context after all strategies!");
-                                log.error("  Thread: {} ({})", threadId, threadName);
-                                log.error("  TxId: {}", txId);
-                                log.error("  This is a JVM ThreadLocal bug or memory corruption");
-                                log.error("================================================================");
-                            } else {
-                                log.info("  [2/4] Context cleared successfully after retry");
-                            }
-                        } else {
-                            log.trace("  [2/4] Context cleared successfully");
-                        }
-                    } else {
-                        log.trace("  [2/4] No context to clear");
-                    }
-                    
-                } catch (Exception e) {
-                    log.error("  [2/4] Context cleanup failed", e);
-                    
-                    // Emergency: try one more time
-                    try {
-                        EntityOperationListener.setContext(null);
-                        EntityOperationListener.clearContext();
-                    } catch (Exception ex) {
-                        log.error("  [2/4] Emergency cleanup failed", ex);
-                    }
-                }
-            } else {
-                log.trace("  [2/4] Context not created by us - skipping");
-            }
-            
-            // Step 3: Clear MDC
-            try {
-                MDC.remove("txId");
-                MDC.remove("businessKey");
-                log.trace("  [3/4] MDC cleared");
-            } catch (Exception e) {
-                log.error("  [3/4] MDC clear failed", e);
-            }
-            
-            // Step 4: Final verification log
-            log.trace("  [4/4] Cleanup completed");
-            
-        } catch (Exception e) {
-            log.error("CRITICAL: Cleanup itself failed!", e);
+        } catch (Throwable e) {
+            log.error("  [1/4] ✗ Lock release failed", e);
+            // Continue cleanup even if lock release fails
         }
         
-        log.trace("=== CLEANUP END === Thread: {} ({})", threadId, threadName);
+        // ═══════════════════════════════════════════════════════════════
+        // STEP 2: Clear EntityOperationListener Context
+        //         CRITICAL: This is the main leak source!
+        // ═══════════════════════════════════════════════════════════════
+        try {
+            // Strategy 1: Check if context exists (NO FLAG DEPENDENCY!)
+            EntityOperationListener.EntityOperationContext ctx = 
+                EntityOperationListener.getContext();
+            
+            if (ctx == null) {
+                log.trace("  [2/4] - No context to clear");
+            } else {
+                log.trace("  [2/4] Context found - clearing...");
+                
+                // Strategy 2: Normal clear
+                EntityOperationListener.clearContext();
+                
+                // Strategy 3: IMMEDIATE VERIFICATION (don't trust clearContext!)
+                EntityOperationListener.EntityOperationContext afterClear = 
+                    EntityOperationListener.getContext();
+                
+                if (afterClear != null) {
+                    log.error("════════════════════════════════════════════════════════════");
+                    log.error("  [2/4] ✗ CRITICAL: Context STILL EXISTS after clearContext()!");
+                    log.error("  Thread: {} ({})", threadId, threadName);
+                    log.error("  TxId: {}", txId);
+                    log.error("════════════════════════════════════════════════════════════");
+                    
+                    // Strategy 4: Force clear via context method
+                    if (!afterClear.isCleared()) {
+                        log.warn("  [2/4] Forcing context.forceClear()...");
+                        afterClear.forceClear();
+                    }
+                    
+                    // Strategy 5: Direct ThreadLocal manipulation
+                    log.warn("  [2/4] Forcing setContext(null) + clearContext()...");
+                    EntityOperationListener.setContext(null);
+                    EntityOperationListener.clearContext();
+                    
+                    // Strategy 6: FINAL VERIFICATION
+                    EntityOperationListener.EntityOperationContext finalCheck = 
+                        EntityOperationListener.getContext();
+                    
+                    if (finalCheck != null) {
+                        log.error("════════════════════════════════════════════════════════════");
+                        log.error("  [2/4] ✗✗ FATAL: Context STILL EXISTS after ALL strategies!");
+                        log.error("  Thread: {} ({})", threadId, threadName);
+                        log.error("  TxId: {}", txId);
+                        log.error("  This indicates JVM ThreadLocal bug or severe memory corruption");
+                        log.error("════════════════════════════════════════════════════════════");
+                        
+                        // Strategy 7: EMERGENCY - Reflection (last resort)
+                        try {
+                            log.warn("  [2/4] Applying EMERGENCY reflection cleanup...");
+                            java.lang.reflect.Field field = EntityOperationListener.class
+                                .getDeclaredField("CONTEXT");
+                            field.setAccessible(true);
+                            ThreadLocal<?> tl = (ThreadLocal<?>) field.get(null);
+                            tl.remove();
+                            tl.set(null);
+                            tl.remove();
+                            
+                            log.warn("  [2/4] ⚠ Emergency reflection cleanup applied");
+                            
+                            // Verify reflection worked
+                            EntityOperationListener.EntityOperationContext afterReflect = 
+                                EntityOperationListener.getContext();
+                            
+                            if (afterReflect == null) {
+                                log.info("  [2/4] ✓ Reflection cleanup SUCCESSFUL");
+                            } else {
+                                log.error("  [2/4] ✗✗✗ REFLECTION CLEANUP FAILED!");
+                                log.error("  >>> THIS IS A CRITICAL JVM BUG <<<");
+                                log.error("  >>> MEMORY LEAK CANNOT BE PREVENTED <<<");
+                                log.error("  >>> RESTART APPLICATION RECOMMENDED <<<");
+                            }
+                            
+                        } catch (Throwable reflectError) {
+                            log.error("  [2/4] ✗✗✗ Emergency reflection cleanup FAILED", reflectError);
+                        }
+                    } else {
+                        log.info("  [2/4] ✓ Context cleared successfully (after retry)");
+                    }
+                } else {
+                    log.trace("  [2/4] ✓ Context cleared successfully (first attempt)");
+                }
+            }
+            
+        } catch (Throwable e) {
+            log.error("  [2/4] ✗ Context cleanup threw exception", e);
+            
+            // Emergency fallback - try basic cleanup
+            try {
+                log.warn("  [2/4] Emergency fallback: basic cleanup...");
+                EntityOperationListener.setContext(null);
+                EntityOperationListener.clearContext();
+            } catch (Throwable ex) {
+                log.error("  [2/4] ✗✗ Emergency fallback FAILED", ex);
+            }
+        }
+        
+        // ═══════════════════════════════════════════════════════════════
+        // STEP 3: Clear MDC (SLF4J Mapped Diagnostic Context)
+        // ═══════════════════════════════════════════════════════════════
+        try {
+            MDC.remove("txId");
+            MDC.remove("businessKey");
+            log.trace("  [3/4] ✓ MDC cleared");
+        } catch (Throwable e) {
+            log.error("  [3/4] ✗ MDC clear failed", e);
+        }
+        
+        // ═══════════════════════════════════════════════════════════════
+        // STEP 4: FINAL VERIFICATION - Ensure no leaks
+        // ═══════════════════════════════════════════════════════════════
+        try {
+            EntityOperationListener.EntityOperationContext finalCtx = 
+                EntityOperationListener.getContext();
+            
+            if (finalCtx != null) {
+                log.error("════════════════════════════════════════════════════════════");
+                log.error("  [4/4] ✗✗✗ VERIFICATION FAILED: Context STILL EXISTS!");
+                log.error("  Thread: {} ({})", threadId, threadName);
+                log.error("  TxId: {}", txId);
+                log.error("════════════════════════════════════════════════════════════");
+                log.error("  >>> THIS IS A CRITICAL BUG <<<");
+                log.error("  >>> MEMORY LEAK IN PROGRESS <<<");
+                log.error("  >>> REPORT THIS IMMEDIATELY <<<");
+                log.error("════════════════════════════════════════════════════════════");
+            } else {
+                log.trace("  [4/4] ✓ Final verification passed - no leaks detected");
+            }
+            
+        } catch (Throwable e) {
+            log.error("  [4/4] ✗ Final verification failed", e);
+        }
+        
+        log.trace("════════════════════════════════════════════════════════════");
+        log.trace("ULTIMATE CLEANUP END - Thread: {} ({})", threadId, threadName);
+        log.trace("════════════════════════════════════════════════════════════");
     }
     
     private void startAllTransactions(Map<String, TransactionStatus> activeTransactions) {
