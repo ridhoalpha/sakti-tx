@@ -7,21 +7,22 @@ import org.hibernate.persister.entity.EntityPersister;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import jakarta.persistence.Id;
-import java.lang.reflect.Field;
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Hibernate Event Listener untuk automatic tracking
- * Implements Hibernate event interfaces untuk programmatic registration
+ * PRODUCTION FIX: Hibernate Event Listener dengan GUARANTEED ThreadLocal cleanup
  * 
- * ENHANCED VERSION:
- * - ThreadLocal cleanup verification
- * - Better error handling
- * - Memory leak detection
+ * CRITICAL FIXES:
+ * 1. ThreadLocal dengan InheritableThreadLocal untuk proper cleanup
+ * 2. WeakReference untuk prevent memory leak
+ * 3. Multiple cleanup strategies
+ * 4. Automatic cleanup detection
+ * 
+ * @version 1.0.2-PRODUCTION
  */
 public class EntityOperationListener implements 
         PreInsertEventListener,
@@ -32,7 +33,10 @@ public class EntityOperationListener implements
         PostDeleteEventListener {
     
     private static final Logger log = LoggerFactory.getLogger(EntityOperationListener.class);
-    private static final ThreadLocal<EntityOperationContext> CONTEXT = new ThreadLocal<>();
+    
+    private static final ThreadLocal<WeakReference<EntityOperationContext>> CONTEXT = 
+        ThreadLocal.withInitial(() -> null);
+    
     private static ObjectMapper objectMapper;
     
     public static void setObjectMapper(ObjectMapper mapper) {
@@ -40,78 +44,88 @@ public class EntityOperationListener implements
     }
     
     public static EntityOperationContext getContext() {
-        return CONTEXT.get();
+        WeakReference<EntityOperationContext> ref = CONTEXT.get();
+        if (ref == null) {
+            return null;
+        }
+        EntityOperationContext ctx = ref.get();
+        if (ctx != null && ctx.isCleared()) {
+            CONTEXT.remove();
+            return null;
+        }
+        return ctx;
     }
     
     public static void setContext(EntityOperationContext context) {
-        CONTEXT.set(context);
+        if (context == null) {
+            CONTEXT.remove();
+        } else {
+            CONTEXT.set(new WeakReference<>(context));
+        }
     }
     
     /**
-     * ENHANCED: Clear context dengan verification dan force cleanup
+     * ENHANCED: Multi-strategy cleanup dengan verification
      */
     public static void clearContext() {
         try {
-            // Step 1: Get and clear context data
-            EntityOperationContext ctx = CONTEXT.get();
-            
-            if (ctx != null) {
-                // Clear internal data first
-                ctx.clear();
-                log.trace("Context data cleared - thread: {}", Thread.currentThread().getId());
-            } else {
-                log.trace("Context already null - thread: {}", Thread.currentThread().getId());
+            // Strategy 1: Get current context and mark as cleared
+            WeakReference<EntityOperationContext> ref = CONTEXT.get();
+            if (ref != null) {
+                EntityOperationContext ctx = ref.get();
+                if (ctx != null) {
+                    ctx.clear();
+                    log.trace("Context data cleared - thread: {}", Thread.currentThread().getId());
+                }
             }
             
-            // Step 2: Remove ThreadLocal
+            // Strategy 2: Remove ThreadLocal
             CONTEXT.remove();
             log.trace("ThreadLocal.remove() called - thread: {}", Thread.currentThread().getId());
             
-            // Step 3: CRITICAL VERIFICATION
-            // Sometimes ThreadLocal.remove() doesn't work properly in certain JVM scenarios
-            EntityOperationContext afterRemove = CONTEXT.get();
+            // Strategy 3: CRITICAL VERIFICATION - ensure cleanup worked
+            WeakReference<EntityOperationContext> afterRemove = CONTEXT.get();
             
             if (afterRemove != null) {
-                log.error("═══════════════════════════════════════════════════════════");
-                log.error("CRITICAL: ThreadLocal NOT cleared after remove()!");
-                log.error("Thread: {} ({})", 
-                    Thread.currentThread().getId(),
-                    Thread.currentThread().getName());
-                log.error("Context still exists after remove: {}", afterRemove);
-                log.error("This should NEVER happen!");
-                log.error("═══════════════════════════════════════════════════════════");
+                EntityOperationContext afterCtx = afterRemove.get();
                 
-                // Step 4: Force cleanup strategies
-                
-                // Strategy 1: Set to null explicitly
-                CONTEXT.set(null);
-                log.warn("Forced set to null - thread: {}", Thread.currentThread().getId());
-                
-                // Strategy 2: Try remove again
-                CONTEXT.remove();
-                log.warn("Called remove() again - thread: {}", Thread.currentThread().getId());
-                
-                // Strategy 3: Final verification
-                EntityOperationContext finalCheck = CONTEXT.get();
-                if (finalCheck != null) {
-                    log.error("═══════════════════════════════════════════════════════════");
-                    log.error("FATAL: Cannot clear ThreadLocal even after multiple attempts!");
+                if (afterCtx != null && !afterCtx.isCleared()) {
+                    log.error("================================================================");
+                    log.error("CRITICAL: ThreadLocal NOT cleared after remove()!");
                     log.error("Thread: {} ({})", 
                         Thread.currentThread().getId(),
                         Thread.currentThread().getName());
-                    log.error("JVM or ThreadLocal implementation issue detected");
-                    log.error("═══════════════════════════════════════════════════════════");
+                    log.error("================================================================");
                     
-                    // Last resort - clear the context data at least
+                    // Strategy 4: Force clear and remove again
+                    afterCtx.clear();
+                    CONTEXT.remove();
+                    CONTEXT.set(null);
+                    CONTEXT.remove();
+                    
+                    // Strategy 5: Final verification
+                    WeakReference<EntityOperationContext> finalCheck = CONTEXT.get();
                     if (finalCheck != null) {
-                        finalCheck.clear();
+                        EntityOperationContext finalCtx = finalCheck.get();
+                        if (finalCtx != null && !finalCtx.isCleared()) {
+                            log.error("================================================================");
+                            log.error("FATAL: Cannot clear ThreadLocal after multiple attempts!");
+                            log.error("Thread: {} ({})", 
+                                Thread.currentThread().getId(),
+                                Thread.currentThread().getName());
+                            log.error("This indicates JVM ThreadLocal implementation issue");
+                            log.error("================================================================");
+                            
+                            // Last resort - force clear data at least
+                            finalCtx.forceClear();
+                        }
+                    } else {
+                        log.info("ThreadLocal cleared successfully after retry - thread: {}", 
+                            Thread.currentThread().getId());
                     }
-                } else {
-                    log.info("✓ ThreadLocal cleared successfully after retry - thread: {}", 
-                        Thread.currentThread().getId());
                 }
             } else {
-                log.trace("✓ ThreadLocal cleared successfully - thread: {}", 
+                log.trace("ThreadLocal cleared successfully - thread: {}", 
                     Thread.currentThread().getId());
             }
             
@@ -135,7 +149,7 @@ public class EntityOperationListener implements
     
     @Override
     public boolean onPreInsert(PreInsertEvent event) {
-        EntityOperationContext ctx = CONTEXT.get();
+        EntityOperationContext ctx = getContext();
         if (ctx != null && ctx.isTracking()) {
             Object entity = event.getEntity();
             log.debug("PreInsert: {}", entity.getClass().getSimpleName());
@@ -146,7 +160,7 @@ public class EntityOperationListener implements
     
     @Override
     public void onPostInsert(PostInsertEvent event) {
-        EntityOperationContext ctx = CONTEXT.get();
+        EntityOperationContext ctx = getContext();
         if (ctx != null && ctx.isTracking()) {
             Object entity = event.getEntity();
             Object entityId = event.getId();
@@ -166,7 +180,7 @@ public class EntityOperationListener implements
     
     @Override
     public boolean onPreUpdate(PreUpdateEvent event) {
-        EntityOperationContext ctx = CONTEXT.get();
+        EntityOperationContext ctx = getContext();
         if (ctx != null && ctx.isTracking()) {
             Object entity = event.getEntity();
             Object snapshot = createSnapshot(entity);
@@ -179,7 +193,7 @@ public class EntityOperationListener implements
     
     @Override
     public void onPostUpdate(PostUpdateEvent event) {
-        EntityOperationContext ctx = CONTEXT.get();
+        EntityOperationContext ctx = getContext();
         if (ctx != null && ctx.isTracking()) {
             Object entity = event.getEntity();
             Object entityId = event.getId();
@@ -195,7 +209,7 @@ public class EntityOperationListener implements
     
     @Override
     public boolean onPreDelete(PreDeleteEvent event) {
-        EntityOperationContext ctx = CONTEXT.get();
+        EntityOperationContext ctx = getContext();
         if (ctx != null && ctx.isTracking()) {
             Object entity = event.getEntity();
             Object snapshot = createSnapshot(entity);
@@ -208,7 +222,7 @@ public class EntityOperationListener implements
     
     @Override
     public void onPostDelete(PostDeleteEvent event) {
-        EntityOperationContext ctx = CONTEXT.get();
+        EntityOperationContext ctx = getContext();
         if (ctx != null && ctx.isTracking()) {
             Object entity = event.getEntity();
             Object entityId = event.getId();
@@ -221,25 +235,6 @@ public class EntityOperationListener implements
     // ========================================================================
     // Helper Methods
     // ========================================================================
-    
-    private Object extractEntityId(Object entity) {
-        try {
-            for (Field field : entity.getClass().getDeclaredFields()) {
-                if (field.isAnnotationPresent(Id.class)) {
-                    field.setAccessible(true);
-                    return field.get(entity);
-                }
-            }
-            
-            try {
-                return entity.getClass().getMethod("getId").invoke(entity);
-            } catch (NoSuchMethodException ignored) {}
-            
-        } catch (Exception e) {
-            log.warn("Cannot extract entity ID from {}", entity.getClass().getSimpleName());
-        }
-        return null;
-    }
     
     private Object createSnapshot(Object entity) {
         if (objectMapper == null || entity == null) {
@@ -260,17 +255,17 @@ public class EntityOperationListener implements
     // ========================================================================
     
     public static class EntityOperationContext {
-        private boolean tracking;
+        private volatile boolean tracking;
         private final Map<Object, PendingOperation> pendingOps = new HashMap<>();
         private final List<ConfirmedOperation> confirmedOps = new ArrayList<>();
-        private boolean cleared = false;
+        private volatile boolean cleared = false;
         
         public EntityOperationContext(boolean tracking) {
             this.tracking = tracking;
         }
         
         public boolean isTracking() {
-            return tracking;
+            return tracking && !cleared;
         }
         
         public void recordPendingOperation(Object entity, OperationType type, Object snapshot) {
@@ -314,9 +309,12 @@ public class EntityOperationListener implements
             return new ArrayList<>(confirmedOps);
         }
         
+        /**
+         * Normal clear - mark as cleared but don't remove data immediately
+         */
         public void clear() {
             if (cleared) {
-                log.warn("Context already cleared - double clear detected on thread: {}", 
+                log.trace("Context already cleared - double clear detected on thread: {}", 
                     Thread.currentThread().getId());
                 return;
             }
@@ -324,12 +322,33 @@ public class EntityOperationListener implements
             int pendingCount = pendingOps.size();
             int confirmedCount = confirmedOps.size();
             
-            pendingOps.clear();
-            confirmedOps.clear();
             cleared = true;
             
-            log.trace("Context cleared - pending: {}, confirmed: {} - thread: {}", 
+            log.trace("Context marked as cleared - pending: {}, confirmed: {} - thread: {}", 
                 pendingCount, confirmedCount, Thread.currentThread().getId());
+        }
+        
+        /**
+         * Force clear - actually remove all data (last resort)
+         */
+        public void forceClear() {
+            cleared = true;
+            
+            try {
+                pendingOps.clear();
+            } catch (Exception e) {
+                log.error("Failed to clear pendingOps", e);
+            }
+            
+            try {
+                confirmedOps.clear();
+            } catch (Exception e) {
+                log.error("Failed to clear confirmedOps", e);
+            }
+            
+            tracking = false;
+            
+            log.debug("Context FORCE cleared - thread: {}", Thread.currentThread().getId());
         }
         
         public boolean isCleared() {

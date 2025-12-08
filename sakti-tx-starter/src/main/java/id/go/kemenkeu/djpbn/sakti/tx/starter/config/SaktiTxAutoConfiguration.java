@@ -38,6 +38,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.core.annotation.Order;
 import org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean;
 import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.transaction.PlatformTransactionManager;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.persistence.EntityManager;
@@ -500,18 +501,18 @@ public class SaktiTxAutoConfiguration {
         return new TransactionRecoveryWorker(logManager, compensator, properties);
     }
 
-    @Bean
-    @ConditionalOnProperty(prefix = "sakti.tx.multi-db.admin-api", name = "enabled", havingValue = "true", matchIfMissing = true)
-    @ConditionalOnBean({TransactionLogManager.class, CompensatingTransactionExecutor.class, TransactionRecoveryWorker.class})
-    public TransactionAdminController transactionAdminController(
-            TransactionLogManager logManager,
-            CompensatingTransactionExecutor compensator,
-            TransactionRecoveryWorker recoveryWorker) {
-        log.info("Creating TransactionAdminController");
-        log.info("   Admin API endpoints available at: /admin/transactions/*");
-        log.info("   WARNING: Ensure proper authentication/authorization is configured");
-        return new TransactionAdminController(logManager, compensator, recoveryWorker);
-    }
+    // @Bean
+    // @ConditionalOnProperty(prefix = "sakti.tx.multi-db.admin-api", name = "enabled", havingValue = "true", matchIfMissing = true)
+    // @ConditionalOnBean({TransactionLogManager.class, CompensatingTransactionExecutor.class, TransactionRecoveryWorker.class})
+    // public TransactionAdminController transactionAdminController(
+    //         TransactionLogManager logManager,
+    //         CompensatingTransactionExecutor compensator,
+    //         TransactionRecoveryWorker recoveryWorker) {
+    //     log.info("Creating TransactionAdminController");
+    //     log.info("   Admin API endpoints available at: /admin/transactions/*");
+    //     log.info("   WARNING: Ensure proper authentication/authorization is configured");
+    //     return new TransactionAdminController(logManager, compensator, recoveryWorker);
+    // }
     
     @Bean
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
@@ -529,9 +530,10 @@ public class SaktiTxAutoConfiguration {
             TransactionLogManager logManager,
             CompensatingTransactionExecutor compensator,
             EntityManagerDatasourceMapper emMapper,
-            @Autowired(required = false) LockManager lockManager) {
+            @Autowired(required = false) LockManager lockManager,
+            @Autowired(required = false) Map<String, PlatformTransactionManager> transactionManagers) {
         log.info("Creating SaktiDistributedTxAspect");
-        return new SaktiDistributedTxAspect(properties, logManager, compensator, emMapper, lockManager);
+        return new SaktiDistributedTxAspect(properties, logManager, compensator, emMapper, lockManager, transactionManagers);
     }
 
     @Bean
