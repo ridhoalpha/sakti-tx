@@ -38,70 +38,43 @@ import java.io.IOException;
  * Each thread gets its own ThreadLocal instance.
  */
 @Component
-@Order(Ordered.HIGHEST_PRECEDENCE) // Execute FIRST (cleanup LAST)
+@Order(Ordered.HIGHEST_PRECEDENCE)
 public class ThreadLocalCleanupFilter implements Filter {
     
     private static final Logger log = LoggerFactory.getLogger(ThreadLocalCleanupFilter.class);
     
     @Override
-    public void init(FilterConfig filterConfig) throws ServletException {
-        log.info("═══════════════════════════════════════════════════════════");
-        log.info("ThreadLocal Cleanup Filter - INITIALIZED");
-        log.info("Order: HIGHEST_PRECEDENCE (guarantees cleanup)");
-        log.info("═══════════════════════════════════════════════════════════");
-    }
-    
-    @Override
     public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
             throws IOException, ServletException {
         
-        // Record thread ID for debugging
         long threadId = Thread.currentThread().getId();
         String threadName = Thread.currentThread().getName();
         
-        log.trace("Request started - Thread: {} ({})", threadId, threadName);
-        
         try {
-            // ═══════════════════════════════════════════════════════════════
-            // Pre-check: Verify ThreadLocal is clean before processing
-            // ═══════════════════════════════════════════════════════════════
-            if (hasLeakedContext()) {
+            // Pre-check: Verify clean state before processing
+            boolean hadLeak = checkAndCleanLeakedContext();
+            
+            if (hadLeak) {
                 log.error("═══════════════════════════════════════════════════════════");
                 log.error("MEMORY LEAK DETECTED: ThreadLocal NOT cleaned from previous request!");
                 log.error("Thread: {} ({})", threadId, threadName);
                 log.error("This indicates a bug in cleanup logic or async operation leak");
                 log.error("═══════════════════════════════════════════════════════════");
-                
-                // Force cleanup immediately
-                forceCleanup();
             }
             
-            // ═══════════════════════════════════════════════════════════════
             // Process request
-            // ═══════════════════════════════════════════════════════════════
             chain.doFilter(request, response);
             
-        } catch (Exception e) {
-            log.error("Request failed - Thread: {} ({})", threadId, threadName, e);
-            throw e;
-            
         } finally {
-            // ═══════════════════════════════════════════════════════════════
-            // CRITICAL: GUARANTEED cleanup in finally block
-            // ═══════════════════════════════════════════════════════════════
+            // CRITICAL: GUARANTEED cleanup
+            boolean hadData = forceCleanupAll();
             
-            log.trace("Cleaning up ThreadLocal - Thread: {} ({})", threadId, threadName);
-            
-            boolean hadLeaks = forceCleanup();
-            
-            if (hadLeaks) {
-                log.warn("ThreadLocal cleanup found data from current request - Thread: {} ({})", 
+            if (hadData) {
+                log.debug("Cleaned ThreadLocal data after request - thread: {} ({})", 
                     threadId, threadName);
             }
             
-            // ═══════════════════════════════════════════════════════════════
             // Final verification
-            // ═══════════════════════════════════════════════════════════════
             if (hasLeakedContext()) {
                 log.error("═══════════════════════════════════════════════════════════");
                 log.error("CRITICAL: ThreadLocal STILL not clean after cleanup!");
@@ -109,86 +82,117 @@ public class ThreadLocalCleanupFilter implements Filter {
                 log.error("This should NEVER happen - indicates severe bug");
                 log.error("═══════════════════════════════════════════════════════════");
                 
-                // Last resort: force remove again
-                forceCleanup();
+                // Emergency force cleanup
+                forceCleanupAll();
             }
-            
-            log.trace("Request completed - Thread: {} ({})", threadId, threadName);
         }
+    }
+    
+    /**
+     * Check if any ThreadLocal context leaked from previous request
+     * Returns true if leak detected and cleaned
+     */
+    private boolean checkAndCleanLeakedContext() {
+        if (hasLeakedContext()) {
+            forceCleanupAll();
+            return true;
+        }
+        return false;
     }
     
     /**
      * Check if any ThreadLocal context is leaked
      */
     private boolean hasLeakedContext() {
-        return EntityOperationListener.getContext() != null ||
-               DistributedTransactionContext.get() != null ||
-               MultiDbTxContextHolder.get() != null ||
-               !MDC.getCopyOfContextMap().isEmpty();
+        boolean hasLeak = false;
+        
+        // Check EntityOperationListener context
+        if (EntityOperationListener.getContext() != null) {
+            hasLeak = true;
+        }
+        
+        // Check DistributedTransactionContext
+        if (DistributedTransactionContext.get() != null) {
+            hasLeak = true;
+        }
+        
+        // Check MultiDbTxContextHolder
+        try {
+            if (MultiDbTxContextHolder.get() != null) {
+                hasLeak = true;
+            }
+        } catch (Exception e) {
+            // Ignore
+        }
+        
+        // Check MDC
+        if (MDC.getCopyOfContextMap() != null && !MDC.getCopyOfContextMap().isEmpty()) {
+            hasLeak = true;
+        }
+        
+        return hasLeak;
     }
     
     /**
-     * Force cleanup all ThreadLocal contexts
-     * 
-     * @return true if any context was found and cleaned
+     * Force cleanup ALL ThreadLocal contexts
+     * Returns true if any data was found and cleaned
      */
-    private boolean forceCleanup() {
+    private boolean forceCleanupAll() {
         boolean hadData = false;
         
-        // ═══════════════════════════════════════════════════════════════
         // 1. EntityOperationListener context
-        // ═══════════════════════════════════════════════════════════════
         try {
             if (EntityOperationListener.getContext() != null) {
                 EntityOperationListener.clearContext();
                 hadData = true;
-                log.debug("Cleaned EntityOperationListener context");
+                
+                // Double-check
+                if (EntityOperationListener.getContext() != null) {
+                    log.error("EntityOperationListener context STILL not cleared!");
+                    
+                    // Try direct manipulation (risky but necessary)
+                    try {
+                        java.lang.reflect.Field field = EntityOperationListener.class
+                            .getDeclaredField("CONTEXT");
+                        field.setAccessible(true);
+                        ThreadLocal<?> tl = (ThreadLocal<?>) field.get(null);
+                        tl.remove();
+                    } catch (Exception e) {
+                        log.error("Failed to force clear via reflection", e);
+                    }
+                }
             }
         } catch (Exception e) {
             log.error("Failed to clear EntityOperationListener context", e);
         }
         
-        // ═══════════════════════════════════════════════════════════════
         // 2. DistributedTransactionContext
-        // ═══════════════════════════════════════════════════════════════
         try {
             if (DistributedTransactionContext.get() != null) {
                 DistributedTransactionContext.clear();
                 hadData = true;
-                log.debug("Cleaned DistributedTransactionContext");
             }
         } catch (Exception e) {
             log.error("Failed to clear DistributedTransactionContext", e);
         }
         
-        // ═══════════════════════════════════════════════════════════════
         // 3. MultiDbTxContextHolder
-        // ═══════════════════════════════════════════════════════════════
         try {
             MultiDbTxContextHolder.clear();
-            log.debug("Cleaned MultiDbTxContextHolder");
         } catch (Exception e) {
             log.error("Failed to clear MultiDbTxContextHolder", e);
         }
         
-        // ═══════════════════════════════════════════════════════════════
-        // 4. MDC (Mapped Diagnostic Context)
-        // ═══════════════════════════════════════════════════════════════
+        // 4. MDC
         try {
             if (MDC.getCopyOfContextMap() != null && !MDC.getCopyOfContextMap().isEmpty()) {
                 MDC.clear();
                 hadData = true;
-                log.debug("Cleaned MDC");
             }
         } catch (Exception e) {
             log.error("Failed to clear MDC", e);
         }
         
         return hadData;
-    }
-    
-    @Override
-    public void destroy() {
-        log.info("ThreadLocal Cleanup Filter - DESTROYED");
     }
 }

@@ -47,21 +47,85 @@ public class EntityOperationListener implements
         CONTEXT.set(context);
     }
     
+    /**
+     * ENHANCED: Clear context dengan verification dan force cleanup
+     */
     public static void clearContext() {
-        EntityOperationContext ctx = CONTEXT.get();
-        if (ctx != null) {
-            ctx.clear();
-        }
-        CONTEXT.remove();
-        
-        // Sanity check - verify it's actually cleared
-        if (CONTEXT.get() != null) {
-            log.error("═══════════════════════════════════════════════════════════");
-            log.error("MEMORY LEAK DETECTED: ThreadLocal context was not cleared!");
-            log.error("This can cause cross-request contamination in thread pools");
-            log.error("═══════════════════════════════════════════════════════════");
-            // Force remove
+        try {
+            // Step 1: Get and clear context data
+            EntityOperationContext ctx = CONTEXT.get();
+            
+            if (ctx != null) {
+                // Clear internal data first
+                ctx.clear();
+                log.trace("Context data cleared - thread: {}", Thread.currentThread().getId());
+            } else {
+                log.trace("Context already null - thread: {}", Thread.currentThread().getId());
+            }
+            
+            // Step 2: Remove ThreadLocal
             CONTEXT.remove();
+            log.trace("ThreadLocal.remove() called - thread: {}", Thread.currentThread().getId());
+            
+            // Step 3: CRITICAL VERIFICATION
+            // Sometimes ThreadLocal.remove() doesn't work properly in certain JVM scenarios
+            EntityOperationContext afterRemove = CONTEXT.get();
+            
+            if (afterRemove != null) {
+                log.error("═══════════════════════════════════════════════════════════");
+                log.error("CRITICAL: ThreadLocal NOT cleared after remove()!");
+                log.error("Thread: {} ({})", 
+                    Thread.currentThread().getId(),
+                    Thread.currentThread().getName());
+                log.error("Context still exists after remove: {}", afterRemove);
+                log.error("This should NEVER happen!");
+                log.error("═══════════════════════════════════════════════════════════");
+                
+                // Step 4: Force cleanup strategies
+                
+                // Strategy 1: Set to null explicitly
+                CONTEXT.set(null);
+                log.warn("Forced set to null - thread: {}", Thread.currentThread().getId());
+                
+                // Strategy 2: Try remove again
+                CONTEXT.remove();
+                log.warn("Called remove() again - thread: {}", Thread.currentThread().getId());
+                
+                // Strategy 3: Final verification
+                EntityOperationContext finalCheck = CONTEXT.get();
+                if (finalCheck != null) {
+                    log.error("═══════════════════════════════════════════════════════════");
+                    log.error("FATAL: Cannot clear ThreadLocal even after multiple attempts!");
+                    log.error("Thread: {} ({})", 
+                        Thread.currentThread().getId(),
+                        Thread.currentThread().getName());
+                    log.error("JVM or ThreadLocal implementation issue detected");
+                    log.error("═══════════════════════════════════════════════════════════");
+                    
+                    // Last resort - clear the context data at least
+                    if (finalCheck != null) {
+                        finalCheck.clear();
+                    }
+                } else {
+                    log.info("✓ ThreadLocal cleared successfully after retry - thread: {}", 
+                        Thread.currentThread().getId());
+                }
+            } else {
+                log.trace("✓ ThreadLocal cleared successfully - thread: {}", 
+                    Thread.currentThread().getId());
+            }
+            
+        } catch (Exception e) {
+            log.error("Exception during clearContext - thread: {}", 
+                Thread.currentThread().getId(), e);
+            
+            // Emergency cleanup
+            try {
+                CONTEXT.set(null);
+                CONTEXT.remove();
+            } catch (Exception ex) {
+                log.error("FATAL: Emergency cleanup failed", ex);
+            }
         }
     }
     
@@ -199,6 +263,7 @@ public class EntityOperationListener implements
         private boolean tracking;
         private final Map<Object, PendingOperation> pendingOps = new HashMap<>();
         private final List<ConfirmedOperation> confirmedOps = new ArrayList<>();
+        private boolean cleared = false;
         
         public EntityOperationContext(boolean tracking) {
             this.tracking = tracking;
@@ -209,10 +274,19 @@ public class EntityOperationListener implements
         }
         
         public void recordPendingOperation(Object entity, OperationType type, Object snapshot) {
+            if (cleared) {
+                log.warn("Attempting to record operation on cleared context!");
+                return;
+            }
             pendingOps.put(entity, new PendingOperation(type, snapshot));
         }
         
         public void confirmOperation(Object entity, OperationType type, Object entityId, Object snapshot) {
+            if (cleared) {
+                log.warn("Attempting to confirm operation on cleared context!");
+                return;
+            }
+            
             PendingOperation pending = pendingOps.remove(entity);
             if (pending != null) {
                 confirmedOps.add(new ConfirmedOperation(
@@ -225,17 +299,41 @@ public class EntityOperationListener implements
         }
         
         public Object getPendingSnapshot(Object entity) {
+            if (cleared) {
+                return null;
+            }
             PendingOperation pending = pendingOps.get(entity);
             return pending != null ? pending.snapshot : null;
         }
         
         public List<ConfirmedOperation> getConfirmedOperations() {
+            if (cleared) {
+                log.warn("Getting operations from cleared context!");
+                return new ArrayList<>();
+            }
             return new ArrayList<>(confirmedOps);
         }
         
         public void clear() {
+            if (cleared) {
+                log.warn("Context already cleared - double clear detected on thread: {}", 
+                    Thread.currentThread().getId());
+                return;
+            }
+            
+            int pendingCount = pendingOps.size();
+            int confirmedCount = confirmedOps.size();
+            
             pendingOps.clear();
             confirmedOps.clear();
+            cleared = true;
+            
+            log.trace("Context cleared - pending: {}, confirmed: {} - thread: {}", 
+                pendingCount, confirmedCount, Thread.currentThread().getId());
+        }
+        
+        public boolean isCleared() {
+            return cleared;
         }
     }
     

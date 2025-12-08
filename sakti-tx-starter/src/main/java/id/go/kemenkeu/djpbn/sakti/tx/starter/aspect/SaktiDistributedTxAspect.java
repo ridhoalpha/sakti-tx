@@ -25,6 +25,9 @@ import org.springframework.stereotype.Component;
 
 import jakarta.persistence.EntityManager;
 import java.lang.reflect.Method;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * ENHANCED Aspect untuk distributed transaction
@@ -50,6 +53,9 @@ public class SaktiDistributedTxAspect {
     private final LockManager lockManager;
     private final ExpressionParser parser = new SpelExpressionParser();
     
+    // NEW: Track EntityManagers untuk transaction management
+    private final Map<String, EntityManager> allEntityManagers;
+    
     public SaktiDistributedTxAspect(SaktiTxProperties properties,
                                    TransactionLogManager logManager,
                                    CompensatingTransactionExecutor compensator,
@@ -60,6 +66,7 @@ public class SaktiDistributedTxAspect {
         this.compensator = compensator;
         this.emMapper = emMapper;
         this.lockManager = lockManager;
+        this.allEntityManagers = emMapper.getAllEntityManagers();
     }
     
     @Around("@annotation(id.go.kemenkeu.djpbn.sakti.tx.starter.annotation.SaktiDistributedTx)")
@@ -70,22 +77,25 @@ public class SaktiDistributedTxAspect {
             return pjp.proceed();
         }
         
-        // Extract method info
-        MethodSignature signature = (MethodSignature) pjp.getSignature();
-        Method method = signature.getMethod();
-        SaktiDistributedTx annotation = method.getAnnotation(SaktiDistributedTx.class);
-        
-        String businessKey = generateBusinessKey(pjp);
         TransactionLog txLog = null;
         EntityOperationListener.EntityOperationContext trackingContext = null;
         LockManager.LockHandle lock = null;
+        boolean contextInitialized = false;
+        boolean transactionsStarted = false;
+        
+        // Track which EntityManagers we started transactions on
+        Set<EntityManager> transactionStartedEMs = new HashSet<>();
         
         try {
-            // Initialize transaction log
+            // Extract method info
+            MethodSignature signature = (MethodSignature) pjp.getSignature();
+            Method method = signature.getMethod();
+            SaktiDistributedTx annotation = method.getAnnotation(SaktiDistributedTx.class);
+            
+            String businessKey = generateBusinessKey(pjp);
             txLog = logManager.createLog(businessKey);
             String txId = txLog.getTxId();
             
-            // Set MDC for distributed tracing
             MDC.put("txId", txId);
             MDC.put("businessKey", businessKey);
             
@@ -101,6 +111,17 @@ public class SaktiDistributedTxAspect {
             // Setup entity tracking context
             trackingContext = new EntityOperationListener.EntityOperationContext(true);
             EntityOperationListener.setContext(trackingContext);
+            contextInitialized = true;
+            
+            // ═══════════════════════════════════════════════════════════════
+            // CRITICAL FIX: Ensure JPA transactions are active
+            // ═══════════════════════════════════════════════════════════════
+            transactionsStarted = ensureTransactionsActive(transactionStartedEMs);
+            
+            if (transactionsStarted) {
+                log.debug("JPA transactions ensured for {} EntityManagers", 
+                    transactionStartedEMs.size());
+            }
             
             // Acquire distributed lock if needed
             if (!annotation.lockKey().isEmpty() && lockManager != null) {
@@ -108,7 +129,7 @@ public class SaktiDistributedTxAspect {
                 lock = acquireLock(lockKey);
             }
             
-            // Execute business logic
+            // Execute business logic (now with transaction context!)
             Object result = pjp.proceed();
             
             // Collect all tracked operations
@@ -127,7 +148,10 @@ public class SaktiDistributedTxAspect {
                 operationCount++;
             }
             
-            // Commit transaction
+            // Commit ALL EntityManager transactions
+            commitAllTransactions(transactionStartedEMs);
+            
+            // Mark transaction log as committed
             commit(txLog);
             
             log.info("═══════════════════════════════════════════════════════════");
@@ -139,53 +163,37 @@ public class SaktiDistributedTxAspect {
             return result;
             
         } catch (Throwable error) {
-            // Enhanced error logging
             String txId = txLog != null ? txLog.getTxId() : "unknown";
             int operationCount = txLog != null ? txLog.getOperations().size() : 0;
             
             log.error("═══════════════════════════════════════════════════════════");
             log.error("Distributed Transaction FAILED");
             log.error("Transaction ID: {}", txId);
-            log.error("Business Key: {}", businessKey);
-            log.error("Method: {}.{}", 
-                signature.getDeclaringType().getSimpleName(), 
-                signature.getName());
+            log.error("Business Key: {}", generateBusinessKey(pjp));
             log.error("Operations Recorded: {}", operationCount);
             log.error("═══════════════════════════════════════════════════════════");
             log.error("Error Type: {}", error.getClass().getName());
             log.error("Error Message: {}", error.getMessage());
             log.error("═══════════════════════════════════════════════════════════");
             
-            // Log each operation for debugging
-            if (txLog != null && !txLog.getOperations().isEmpty()) {
-                log.error("Operations that will be rolled back:");
-                for (TransactionLog.OperationLog op : txLog.getOperations()) {
-                    log.error("  → [{}] {} {} on {} [id={}]",
-                        op.getSequence(),
-                        op.getOperationType(), 
-                        op.getEntityClass(), 
-                        op.getDatasource(), 
-                        op.getEntityId());
-                }
+            // Rollback ALL EntityManager transactions FIRST
+            if (transactionsStarted) {
+                rollbackAllTransactions(transactionStartedEMs);
             }
             
-            log.error("═══════════════════════════════════════════════════════════");
-            log.error("Full stacktrace:", error);
-            log.error("═══════════════════════════════════════════════════════════");
-            
-            // Perform rollback with retry
+            // Then perform compensating rollback
             boolean rollbackSuccess = false;
             if (txLog != null) {
                 rollbackSuccess = rollbackWithRetry(txLog, error);
             }
             
-            // Throw enhanced exception with context
+            log.error("═══════════════════════════════════════════════════════════");
+            
+            // Throw enhanced exception
             throw new TransactionRollbackException(
-                String.format("Transaction %s failed and %s: %s. Operations: %d. Original error: %s",
+                String.format("Transaction %s failed and %s: %s",
                     txId,
                     rollbackSuccess ? "rolled back successfully" : "ROLLBACK FAILED",
-                    rollbackSuccess ? "All changes reverted" : "PARTIAL COMMIT MAY EXIST",
-                    operationCount,
                     error.getMessage()),
                 error,
                 txId,
@@ -194,37 +202,147 @@ public class SaktiDistributedTxAspect {
             );
             
         } finally {
-            // CRITICAL: Guaranteed cleanup
+            // ═══════════════════════════════════════════════════════════════
+            // CRITICAL: GUARANTEED cleanup
+            // ═══════════════════════════════════════════════════════════════
+            
             log.trace("Cleaning up transaction resources...");
             
-            // Release lock
-            if (lock != null) {
-                try {
-                    lock.release();
-                    log.trace("Lock released");
-                } catch (Exception e) {
-                    log.error("Failed to release lock", e);
-                }
-            }
-            
-            // Clear entity operation context
             try {
-                EntityOperationListener.clearContext();
-                log.trace("Entity operation context cleared");
+                // 1. Release lock
+                if (lock != null) {
+                    try {
+                        lock.release();
+                        log.trace("Lock released");
+                    } catch (Exception e) {
+                        log.error("Failed to release lock", e);
+                    }
+                }
+                
+                // 2. Clear entity operation context - MUST be called!
+                if (contextInitialized) {
+                    try {
+                        EntityOperationListener.clearContext();
+                        log.trace("Entity operation context cleared");
+                        
+                        // Verify cleanup
+                        if (EntityOperationListener.getContext() != null) {
+                            log.error("═══════════════════════════════════════════════════════════");
+                            log.error("CRITICAL: Context NOT cleared after clearContext()!");
+                            log.error("Thread: {} ({})", 
+                                Thread.currentThread().getId(),
+                                Thread.currentThread().getName());
+                            log.error("═══════════════════════════════════════════════════════════");
+                            
+                            // Force clear again
+                            EntityOperationListener.clearContext();
+                        }
+                    } catch (Exception e) {
+                        log.error("Failed to clear entity operation context", e);
+                    }
+                }
+                
+                // 3. Clear MDC
+                MDC.remove("txId");
+                MDC.remove("businessKey");
+                
             } catch (Exception e) {
-                log.error("Failed to clear entity operation context", e);
+                log.error("CRITICAL: Cleanup failed!", e);
             }
+        }
+    }
+    
+    /**
+     * CRITICAL FIX: Ensure JPA transactions are active
+     * 
+     * Jika method dengan @SaktiDistributedTx TIDAK punya @Transactional,
+     * kita harus start transaction manual untuk semua EntityManager
+     */
+    private boolean ensureTransactionsActive(Set<EntityManager> transactionStartedEMs) {
+        if (allEntityManagers == null || allEntityManagers.isEmpty()) {
+            log.warn("No EntityManagers available - transaction context may not be active");
+            return false;
+        }
+        
+        boolean anyStarted = false;
+        
+        for (Map.Entry<String, EntityManager> entry : allEntityManagers.entrySet()) {
+            String datasource = entry.getKey();
+            EntityManager em = entry.getValue();
             
-            // Clear MDC
-            MDC.remove("txId");
-            MDC.remove("businessKey");
-            
-            // Sanity check - verify cleanup
-            if (EntityOperationListener.getContext() != null) {
-                log.error("═══════════════════════════════════════════════════════════");
-                log.error("CRITICAL: ThreadLocal context NOT cleared properly!");
-                log.error("This indicates a bug in cleanup logic");
-                log.error("═══════════════════════════════════════════════════════════");
+            try {
+                // Check if already in transaction (from @Transactional)
+                if (em.isJoinedToTransaction()) {
+                    log.trace("EntityManager {} already in transaction (container-managed)", datasource);
+                    continue;
+                }
+                
+                // Start transaction manually if not already active
+                if (!em.getTransaction().isActive()) {
+                    log.debug("Starting transaction for EntityManager: {}", datasource);
+                    em.getTransaction().begin();
+                    transactionStartedEMs.add(em);
+                    anyStarted = true;
+                } else {
+                    log.trace("EntityManager {} transaction already active", datasource);
+                }
+                
+            } catch (IllegalStateException e) {
+                // Container-managed EntityManager - cannot call getTransaction()
+                // This is OK - container will manage the transaction
+                log.trace("EntityManager {} is container-managed", datasource);
+            } catch (Exception e) {
+                log.error("Failed to check/start transaction for {}: {}", 
+                    datasource, e.getMessage());
+            }
+        }
+        
+        return anyStarted;
+    }
+    
+    /**
+     * Commit all transactions that we started
+     */
+    private void commitAllTransactions(Set<EntityManager> transactionStartedEMs) {
+        if (transactionStartedEMs.isEmpty()) {
+            log.trace("No manual transactions to commit");
+            return;
+        }
+        
+        log.debug("Committing {} manual transactions", transactionStartedEMs.size());
+        
+        for (EntityManager em : transactionStartedEMs) {
+            try {
+                if (em.getTransaction().isActive()) {
+                    em.getTransaction().commit();
+                    log.trace("Transaction committed for EntityManager");
+                }
+            } catch (Exception e) {
+                log.error("Failed to commit transaction: {}", e.getMessage());
+                // Don't throw - let compensating transaction handle it
+            }
+        }
+    }
+    
+    /**
+     * Rollback all transactions that we started
+     */
+    private void rollbackAllTransactions(Set<EntityManager> transactionStartedEMs) {
+        if (transactionStartedEMs.isEmpty()) {
+            log.trace("No manual transactions to rollback");
+            return;
+        }
+        
+        log.warn("Rolling back {} manual transactions", transactionStartedEMs.size());
+        
+        for (EntityManager em : transactionStartedEMs) {
+            try {
+                if (em.getTransaction().isActive()) {
+                    em.getTransaction().rollback();
+                    log.trace("Transaction rolled back for EntityManager");
+                }
+            } catch (Exception e) {
+                log.error("Failed to rollback transaction: {}", e.getMessage());
             }
         }
     }
