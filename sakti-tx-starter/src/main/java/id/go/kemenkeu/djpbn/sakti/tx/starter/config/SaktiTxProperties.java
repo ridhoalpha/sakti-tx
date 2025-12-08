@@ -13,41 +13,6 @@ public class SaktiTxProperties {
     private Jms jms = new Jms();
     private MultiDb multiDb = new MultiDb();
     private Health health = new Health();
-    private Security security = new Security();
-    public static class Security {
-        private boolean enabled = true;
-        private boolean csrfEnabled = false; // Disabled for REST API
-        private String defaultAdminUsername = "admin";
-        private String defaultAdminPassword = "securePass123"; // CHANGE THIS!
-        private boolean auditLoggingEnabled = true;
-        private String[] ipWhitelist = {}; // Empty = allow all
-        
-        public boolean isEnabled() { return enabled; }
-        public void setEnabled(boolean enabled) { this.enabled = enabled; }
-        
-        public boolean isCsrfEnabled() { return csrfEnabled; }
-        public void setCsrfEnabled(boolean csrfEnabled) { this.csrfEnabled = csrfEnabled; }
-        
-        public String getDefaultAdminUsername() { return defaultAdminUsername; }
-        public void setDefaultAdminUsername(String defaultAdminUsername) { 
-            this.defaultAdminUsername = defaultAdminUsername; 
-        }
-        
-        public String getDefaultAdminPassword() { return defaultAdminPassword; }
-        public void setDefaultAdminPassword(String defaultAdminPassword) { 
-            this.defaultAdminPassword = defaultAdminPassword; 
-        }
-        
-        public boolean isAuditLoggingEnabled() { return auditLoggingEnabled; }
-        public void setAuditLoggingEnabled(boolean auditLoggingEnabled) { 
-            this.auditLoggingEnabled = auditLoggingEnabled; 
-        }
-        
-        public String[] getIpWhitelist() { return ipWhitelist; }
-        public void setIpWhitelist(String[] ipWhitelist) { 
-            this.ipWhitelist = ipWhitelist; 
-        }
-    }
     
     public static class Dragonfly {
         private boolean enabled = false;
@@ -223,11 +188,14 @@ public class SaktiTxProperties {
             MANUAL
         }
         
+        /**
+         * Recovery worker configuration
+         */
         public static class Recovery {
             private boolean enabled = true;
-            private long scanIntervalMs = 60000;
-            private long initialDelayMs = 30000;
-            private long stallTimeoutMs = 300000;
+            private long scanIntervalMs = 60000;      // 1 minute
+            private long initialDelayMs = 30000;      // 30 seconds
+            private long stallTimeoutMs = 300000;     // 5 minutes
             private int maxRecoveryAttempts = 5;
             
             public boolean isEnabled() { return enabled; }
@@ -254,6 +222,9 @@ public class SaktiTxProperties {
             }
         }
         
+        /**
+         * Admin API configuration
+         */
         public static class AdminApi {
             private boolean enabled = true;
             
@@ -261,6 +232,7 @@ public class SaktiTxProperties {
             public void setEnabled(boolean enabled) { this.enabled = enabled; }
         }
         
+        // Existing getters and setters
         public boolean isEnabled() { return enabled; }
         public void setEnabled(boolean enabled) { this.enabled = enabled; }
         
@@ -271,7 +243,7 @@ public class SaktiTxProperties {
         
         public int getMaxRollbackRetries() { return maxRollbackRetries; }
         public void setMaxRollbackRetries(int maxRollbackRetries) { 
-            this.maxRollbackRetries = maxRollbackRetries;
+            this.maxRollbackRetries = maxRollbackRetries; 
         }
         
         public long getRollbackRetryBackoffMs() { return rollbackRetryBackoffMs; }
@@ -279,6 +251,7 @@ public class SaktiTxProperties {
             this.rollbackRetryBackoffMs = rollbackRetryBackoffMs; 
         }
         
+        // NEW getters
         public Recovery getRecovery() { return recovery; }
         public void setRecovery(Recovery recovery) { this.recovery = recovery; }
         
@@ -293,7 +266,6 @@ public class SaktiTxProperties {
         public void setEnabled(boolean enabled) { this.enabled = enabled; }
     }
     
-    // Getters & Setters
     public Dragonfly getDragonfly() { return dragonfly; }
     public void setDragonfly(Dragonfly dragonfly) { this.dragonfly = dragonfly; }
     
@@ -319,7 +291,4 @@ public class SaktiTxProperties {
     
     public Health getHealth() { return health; }
     public void setHealth(Health health) { this.health = health; }
-    
-    public Security getSecurity() { return security; }
-    public void setSecurity(Security security) { this.security = security; }
 }

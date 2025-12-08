@@ -26,6 +26,7 @@ import org.redisson.config.Config;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
@@ -147,10 +148,9 @@ public class SaktiTxAutoConfiguration {
     }
 
     @Bean
-    @ConditionalOnMissingBean(ObjectMapper.class)
     @Order(0)
-    public ObjectMapper objectMapper() {
-        log.info("Creating ObjectMapper with JSR-310 support");
+    public ObjectMapper saktiTxObjectMapper() {
+        log.debug("Creating ObjectMapper with JSR-310 support");
         
         ObjectMapper mapper = new ObjectMapper();
         
@@ -158,7 +158,7 @@ public class SaktiTxAutoConfiguration {
             mapper.registerModule(new JavaTimeModule());
             mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
             mapper.findAndRegisterModules();
-            log.info("Registered modules: {}", mapper.getRegisteredModuleIds());
+            log.debug("Registered modules: {}", mapper.getRegisteredModuleIds());
             
             validateInstantSerialization(mapper);
             
@@ -173,6 +173,11 @@ public class SaktiTxAutoConfiguration {
             log.error("Error: {}", e.getMessage(), e);
             log.error("");
             log.error("This will cause ALL transaction logging to FAIL!");
+            log.error("Solution: Add to pom.xml:");
+            log.error("  <dependency>");
+            log.error("    <groupId>com.fasterxml.jackson.datatype</groupId>");
+            log.error("    <artifactId>jackson-datatype-jsr310</artifactId>");
+            log.error("  </dependency>");
             log.error("═══════════════════════════════════════════════════════════");
             throw new IllegalStateException("Cannot configure ObjectMapper for transaction logging", e);
         }
@@ -273,10 +278,10 @@ public class SaktiTxAutoConfiguration {
     @ConditionalOnBean(RedissonClient.class)
     public CacheManager saktiCacheManager(
             RedissonClient redissonClient,
-            ObjectMapper objectMapper,
+            @Qualifier("saktiTxObjectMapper") ObjectMapper saktiTxObjectMapper,
             SaktiTxProperties properties) {
         log.info("Creating CacheManager (prefix: {})", properties.getCache().getPrefix());
-        return new CacheManager(redissonClient, objectMapper, properties.getCache().getPrefix());
+        return new CacheManager(redissonClient, saktiTxObjectMapper, properties.getCache().getPrefix());
     }
 
     @Bean
@@ -362,15 +367,15 @@ public class SaktiTxAutoConfiguration {
     @ConditionalOnBean({RedissonClient.class, ObjectMapper.class})
     public TransactionLogManager transactionLogManager(
             RedissonClient redissonClient,
-            ObjectMapper objectMapper,
+            @Qualifier("saktiTxObjectMapper") ObjectMapper saktiTxObjectMapper,
             SaktiTxProperties properties) {
         
         log.info("Creating TransactionLogManager");
         
         try {
             java.time.Instant test = java.time.Instant.now();
-            String json = objectMapper.writeValueAsString(test);
-            objectMapper.readValue(json, java.time.Instant.class);
+            String json = saktiTxObjectMapper.writeValueAsString(test);
+            saktiTxObjectMapper.readValue(json, java.time.Instant.class);
             log.debug("✓ ObjectMapper validation passed for TransactionLogManager");
         } catch (Exception e) {
             log.error("═══════════════════════════════════════════════════════════");
@@ -390,7 +395,7 @@ public class SaktiTxAutoConfiguration {
             log.info("   Enable with: sakti.tx.dragonfly.wait-for-sync=true");
         }
         
-        return new TransactionLogManager(redissonClient, objectMapper, waitForSync, waitTimeoutMs);
+        return new TransactionLogManager(redissonClient, saktiTxObjectMapper, waitForSync, waitTimeoutMs);
     }
     
     @Bean
@@ -467,7 +472,7 @@ public class SaktiTxAutoConfiguration {
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
     public CompensatingTransactionExecutor compensatingTransactionExecutor(
             EntityManagerDatasourceMapper mapper,
-            ObjectMapper objectMapper) {
+            @Qualifier("saktiTxObjectMapper") ObjectMapper saktiTxObjectMapper) {
         log.info("Creating CompensatingTransactionExecutor");
         
         Map<String, EntityManager> entityManagers = mapper.getAllEntityManagers();
@@ -478,7 +483,7 @@ public class SaktiTxAutoConfiguration {
             log.info("Found {} EntityManager beans", entityManagers.size());
         }
         
-        return new CompensatingTransactionExecutor(entityManagers, objectMapper);
+        return new CompensatingTransactionExecutor(entityManagers, saktiTxObjectMapper);
     }
 
     @Bean
@@ -510,9 +515,9 @@ public class SaktiTxAutoConfiguration {
     
     @Bean
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
-    public ServiceOperationInterceptor serviceOperationInterceptor(ObjectMapper objectMapper) {
+    public ServiceOperationInterceptor serviceOperationInterceptor(@Qualifier("saktiTxObjectMapper") ObjectMapper saktiTxObjectMapper) {
         log.info("Creating ServiceOperationInterceptor");
-        return new ServiceOperationInterceptor(objectMapper);
+        return new ServiceOperationInterceptor(saktiTxObjectMapper);
     }
     
     @Bean
