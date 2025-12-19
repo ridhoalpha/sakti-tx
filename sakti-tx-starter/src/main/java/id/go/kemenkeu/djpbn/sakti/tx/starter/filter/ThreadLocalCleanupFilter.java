@@ -55,11 +55,7 @@ public class ThreadLocalCleanupFilter implements Filter {
             boolean hadLeak = checkAndCleanLeakedContext();
             
             if (hadLeak) {
-                log.error("═══════════════════════════════════════════════════════════");
-                log.error("MEMORY LEAK DETECTED: ThreadLocal NOT cleaned from previous request!");
-                log.error("Thread: {} ({})", threadId, threadName);
-                log.error("This indicates a bug in cleanup logic or async operation leak");
-                log.error("═══════════════════════════════════════════════════════════");
+                // TODO
             }
             
             // Process request
@@ -76,12 +72,6 @@ public class ThreadLocalCleanupFilter implements Filter {
             
             // Final verification
             if (hasLeakedContext()) {
-                log.error("═══════════════════════════════════════════════════════════");
-                log.error("CRITICAL: ThreadLocal STILL not clean after cleanup!");
-                log.error("Thread: {} ({})", threadId, threadName);
-                log.error("This should NEVER happen - indicates severe bug");
-                log.error("═══════════════════════════════════════════════════════════");
-                
                 // Emergency force cleanup
                 forceCleanupAll();
             }

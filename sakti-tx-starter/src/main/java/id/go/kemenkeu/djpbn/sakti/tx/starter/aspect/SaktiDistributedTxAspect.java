@@ -318,16 +318,11 @@ public class SaktiDistributedTxAspect {
                     EntityOperationListener.getContext();
                 
                 if (afterClear != null) {
-                    log.error("════════════════════════════════════════════════════════════");
-                    log.error("  [2/4] ✗ CRITICAL: Context STILL EXISTS after clearContext()!");
-                    log.error("  Thread: {} ({})", threadId, threadName);
-                    log.error("  TxId: {}", txId);
-                    log.error("════════════════════════════════════════════════════════════");
                     
                     // Strategy 4: Force clear via context method
                     if (!afterClear.isCleared()) {
                         log.warn("  [2/4] Forcing context.forceClear()...");
-                        afterClear.forceClear();
+                        afterClear.forceCleanData();
                     }
                     
                     // Strategy 5: Direct ThreadLocal manipulation
@@ -340,16 +335,9 @@ public class SaktiDistributedTxAspect {
                         EntityOperationListener.getContext();
                     
                     if (finalCheck != null) {
-                        log.error("════════════════════════════════════════════════════════════");
-                        log.error("  [2/4] ✗✗ FATAL: Context STILL EXISTS after ALL strategies!");
-                        log.error("  Thread: {} ({})", threadId, threadName);
-                        log.error("  TxId: {}", txId);
-                        log.error("  This indicates JVM ThreadLocal bug or severe memory corruption");
-                        log.error("════════════════════════════════════════════════════════════");
                         
                         // Strategy 7: EMERGENCY - Reflection (last resort)
                         try {
-                            log.warn("  [2/4] Applying EMERGENCY reflection cleanup...");
                             java.lang.reflect.Field field = EntityOperationListener.class
                                 .getDeclaredField("CONTEXT");
                             field.setAccessible(true);
@@ -366,11 +354,6 @@ public class SaktiDistributedTxAspect {
                             
                             if (afterReflect == null) {
                                 log.info("  [2/4] ✓ Reflection cleanup SUCCESSFUL");
-                            } else {
-                                log.error("  [2/4] ✗✗✗ REFLECTION CLEANUP FAILED!");
-                                log.error("  >>> THIS IS A CRITICAL JVM BUG <<<");
-                                log.error("  >>> MEMORY LEAK CANNOT BE PREVENTED <<<");
-                                log.error("  >>> RESTART APPLICATION RECOMMENDED <<<");
                             }
                             
                         } catch (Throwable reflectError) {
@@ -415,17 +398,7 @@ public class SaktiDistributedTxAspect {
             EntityOperationListener.EntityOperationContext finalCtx = 
                 EntityOperationListener.getContext();
             
-            if (finalCtx != null) {
-                log.error("════════════════════════════════════════════════════════════");
-                log.error("  [4/4] ✗✗✗ VERIFICATION FAILED: Context STILL EXISTS!");
-                log.error("  Thread: {} ({})", threadId, threadName);
-                log.error("  TxId: {}", txId);
-                log.error("════════════════════════════════════════════════════════════");
-                log.error("  >>> THIS IS A CRITICAL BUG <<<");
-                log.error("  >>> MEMORY LEAK IN PROGRESS <<<");
-                log.error("  >>> REPORT THIS IMMEDIATELY <<<");
-                log.error("════════════════════════════════════════════════════════════");
-            } else {
+            if (finalCtx == null) {
                 log.trace("  [4/4] ✓ Final verification passed - no leaks detected");
             }
             

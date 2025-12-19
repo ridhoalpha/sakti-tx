@@ -7,22 +7,20 @@ import org.hibernate.persister.entity.EntityPersister;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * PRODUCTION FIX: Hibernate Event Listener dengan GUARANTEED ThreadLocal cleanup
+ * SECURITY FIX 2: Strong Reference Snapshot
  * 
- * CRITICAL FIXES:
- * 1. ThreadLocal dengan InheritableThreadLocal untuk proper cleanup
- * 2. WeakReference untuk prevent memory leak
- * 3. Multiple cleanup strategies
- * 4. Automatic cleanup detection
+ * CHANGED:
+ * - WeakReference removed (GC could delete critical snapshot data)
+ * - Use strong references with explicit cleanup
+ * - Snapshot immediately persisted to Redis via TransactionLogManager
  * 
- * @version 1.0.2-PRODUCTION
+ * @version 1.0.3-SECURITY-FIX
  */
 public class EntityOperationListener implements 
         PreInsertEventListener,
@@ -34,7 +32,10 @@ public class EntityOperationListener implements
     
     private static final Logger log = LoggerFactory.getLogger(EntityOperationListener.class);
     
-    private static final ThreadLocal<WeakReference<EntityOperationContext>> CONTEXT = 
+    // ═══════════════════════════════════════════════════════════════
+    // SECURITY FIX: Strong Reference (no WeakReference)
+    // ═══════════════════════════════════════════════════════════════
+    private static final ThreadLocal<EntityOperationContext> CONTEXT = 
         ThreadLocal.withInitial(() -> null);
     
     private static ObjectMapper objectMapper;
@@ -44,11 +45,7 @@ public class EntityOperationListener implements
     }
     
     public static EntityOperationContext getContext() {
-        WeakReference<EntityOperationContext> ref = CONTEXT.get();
-        if (ref == null) {
-            return null;
-        }
-        EntityOperationContext ctx = ref.get();
+        EntityOperationContext ctx = CONTEXT.get();
         if (ctx != null && ctx.isCleared()) {
             CONTEXT.remove();
             return null;
@@ -60,86 +57,53 @@ public class EntityOperationListener implements
         if (context == null) {
             CONTEXT.remove();
         } else {
-            CONTEXT.set(new WeakReference<>(context));
+            CONTEXT.set(context);
         }
     }
     
     /**
-     * ENHANCED: Multi-strategy cleanup dengan GUARANTEED removal
-     * 
-     * Location: EntityOperationListener.java, line ~90
-     * REPLACE existing clearContext() method with this!
+     * ENHANCED: Multi-strategy cleanup with verification
      */
     public static void clearContext() {
         long threadId = Thread.currentThread().getId();
         
         try {
-            // Strategy 1: Get and clear context
-            WeakReference<EntityOperationContext> ref = CONTEXT.get();
-            if (ref != null) {
-                EntityOperationContext ctx = ref.get();
-                if (ctx != null) {
-                    ctx.clear();
-                    log.trace("Context data cleared - thread: {}", threadId);
-                }
+            // Strategy 1: Get and clear context data
+            EntityOperationContext ctx = CONTEXT.get();
+            if (ctx != null) {
+                ctx.forceCleanData();  // Clear data immediately
+                log.trace("Context data cleared - thread: {}", threadId);
             }
             
             // Strategy 2: Remove ThreadLocal (PRIMARY CLEANUP)
             CONTEXT.remove();
             log.trace("ThreadLocal.remove() called - thread: {}", threadId);
             
-            // Strategy 3: CRITICAL VERIFICATION - MUST CHECK!
-            WeakReference<EntityOperationContext> afterRemove = CONTEXT.get();
+            // Strategy 3: VERIFICATION
+            EntityOperationContext afterRemove = CONTEXT.get();
             
             if (afterRemove != null) {
-                EntityOperationContext afterCtx = afterRemove.get();
                 
-                if (afterCtx != null && !afterCtx.isCleared()) {
-                    // ❌ CLEANUP FAILED - This should NEVER happen!
-                    log.error("================================================================");
-                    log.error("CRITICAL: ThreadLocal NOT cleared after remove()!");
-                    log.error("Thread: {} ({})", threadId, Thread.currentThread().getName());
-                    log.error("================================================================");
-                    
-                    // Strategy 4: Force clear + multiple remove attempts
-                    afterCtx.forceClear();  // Clear data first
-                    CONTEXT.remove();        // Remove again
-                    CONTEXT.set(null);       // Set to null explicitly
-                    CONTEXT.remove();        // Remove one more time
-                    
-                    // Strategy 5: FINAL VERIFICATION
-                    WeakReference<EntityOperationContext> finalCheck = CONTEXT.get();
-                    if (finalCheck != null) {
-                        EntityOperationContext finalCtx = finalCheck.get();
-                        if (finalCtx != null && !finalCtx.isCleared()) {
-                            // ❌❌ STILL FAILED!
-                            log.error("================================================================");
-                            log.error("FATAL: Cannot clear ThreadLocal after multiple attempts!");
-                            log.error("Thread: {} ({})", threadId, Thread.currentThread().getName());
-                            log.error("This indicates JVM ThreadLocal implementation issue");
-                            log.error("================================================================");
-                            
-                            // Last resort - at least clear the data
-                            finalCtx.forceClear();
-                        } else {
-                            log.info("ThreadLocal cleared successfully after retry - thread: {}", threadId);
-                        }
-                    } else {
-                        log.info("ThreadLocal cleared successfully after retry - thread: {}", threadId);
-                    }
+                // Emergency cleanup
+                afterRemove.forceCleanData();
+                CONTEXT.remove();
+                CONTEXT.set(null);
+                CONTEXT.remove();
+                
+                // Final check
+                EntityOperationContext finalCheck = CONTEXT.get();
+                if (finalCheck != null) {
+                    log.error("FATAL: Cannot clear ThreadLocal after multiple attempts!");
                 }
             } else {
-                // ✅ SUCCESS - Context properly cleared
-                log.trace("ThreadLocal cleared successfully (first attempt) - thread: {}", threadId);
+                log.trace("ThreadLocal cleared successfully - thread: {}", threadId);
             }
             
         } catch (Exception e) {
             log.error("Exception during clearContext - thread: {}", threadId, e);
             
-            // Emergency cleanup - try everything
+            // Emergency cleanup
             try {
-                CONTEXT.set(null);
-                CONTEXT.remove();
                 CONTEXT.set(null);
                 CONTEXT.remove();
             } catch (Exception ex) {
@@ -241,6 +205,10 @@ public class EntityOperationListener implements
     // Helper Methods
     // ========================================================================
     
+    /**
+     * Create snapshot dengan deep clone
+     * CRITICAL: Harus menghasilkan snapshot yang independent
+     */
     private Object createSnapshot(Object entity) {
         if (objectMapper == null || entity == null) {
             return null;
@@ -259,6 +227,9 @@ public class EntityOperationListener implements
     // Context Classes
     // ========================================================================
     
+    /**
+     * SECURITY FIX: Strong reference context
+     */
     public static class EntityOperationContext {
         private volatile boolean tracking;
         private final Map<Object, PendingOperation> pendingOps = new HashMap<>();
@@ -315,28 +286,24 @@ public class EntityOperationListener implements
         }
         
         /**
-         * Normal clear - mark as cleared but don't remove data immediately
+         * Mark as cleared (lazy cleanup)
          */
         public void clear() {
             if (cleared) {
-                log.trace("Context already cleared - double clear detected on thread: {}", 
+                log.trace("Context already cleared - thread: {}", 
                     Thread.currentThread().getId());
                 return;
             }
             
-            int pendingCount = pendingOps.size();
-            int confirmedCount = confirmedOps.size();
-            
             cleared = true;
-            
-            log.trace("Context marked as cleared - pending: {}, confirmed: {} - thread: {}", 
-                pendingCount, confirmedCount, Thread.currentThread().getId());
+            log.trace("Context marked as cleared - thread: {}", 
+                Thread.currentThread().getId());
         }
         
         /**
-         * Force clear - actually remove all data (last resort)
+         * SECURITY FIX: Force clean all data immediately
          */
-        public void forceClear() {
+        public void forceCleanData() {
             cleared = true;
             
             try {
@@ -353,7 +320,8 @@ public class EntityOperationListener implements
             
             tracking = false;
             
-            log.debug("Context FORCE cleared - thread: {}", Thread.currentThread().getId());
+            log.debug("Context data FORCE cleaned - thread: {}", 
+                Thread.currentThread().getId());
         }
         
         public boolean isCleared() {
@@ -363,7 +331,7 @@ public class EntityOperationListener implements
     
     public static class PendingOperation {
         final OperationType type;
-        final Object snapshot;
+        final Object snapshot;  // Strong reference
         
         PendingOperation(OperationType type, Object snapshot) {
             this.type = type;
@@ -375,7 +343,7 @@ public class EntityOperationListener implements
         public final String entityClass;
         public final OperationType type;
         public final Object entityId;
-        public final Object snapshot;
+        public final Object snapshot;  // Strong reference
         
         ConfirmedOperation(String entityClass, OperationType type, Object entityId, Object snapshot) {
             this.entityClass = entityClass;
