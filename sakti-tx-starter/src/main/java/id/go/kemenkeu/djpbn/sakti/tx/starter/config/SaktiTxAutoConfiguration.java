@@ -5,12 +5,18 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import id.go.kemenkeu.djpbn.sakti.tx.core.cache.CacheManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.compensate.CompensatingTransactionExecutor;
+import id.go.kemenkeu.djpbn.sakti.tx.core.compensate.CompensationCircuitBreaker;
 import id.go.kemenkeu.djpbn.sakti.tx.core.idempotency.IdempotencyManager;
+import id.go.kemenkeu.djpbn.sakti.tx.core.inspection.CascadeDetector;
+import id.go.kemenkeu.djpbn.sakti.tx.core.inspection.TriggerDetector;
 import id.go.kemenkeu.djpbn.sakti.tx.core.listener.EntityOperationListener;
 import id.go.kemenkeu.djpbn.sakti.tx.core.lock.LockManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.lock.RedissonLockManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.log.TransactionLogManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.mapper.EntityManagerDatasourceMapper;
+import id.go.kemenkeu.djpbn.sakti.tx.core.metrics.TransactionMetrics;
+import id.go.kemenkeu.djpbn.sakti.tx.core.validation.DefaultPreCommitValidator;
+import id.go.kemenkeu.djpbn.sakti.tx.core.validation.PreCommitValidator;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.admin.TransactionAdminController;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.aspect.*;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.event.JmsEventPublisher;
@@ -20,6 +26,7 @@ import id.go.kemenkeu.djpbn.sakti.tx.starter.service.DistributedLockService;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.service.impl.DistributedLockServiceImpl;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.worker.TransactionRecoveryWorker;
 import jakarta.jms.ConnectionFactory;
+import jakarta.persistence.EntityManager;
 import org.redisson.Redisson;
 import org.redisson.api.RedissonClient;
 import org.redisson.config.Config;
@@ -41,7 +48,7 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.transaction.PlatformTransactionManager;
 
 import jakarta.annotation.PostConstruct;
-import jakarta.persistence.EntityManager;
+import java.time.Duration;
 import java.util.Map;
 
 @Configuration
@@ -50,7 +57,6 @@ import java.util.Map;
 public class SaktiTxAutoConfiguration {
 
     private static final Logger log = LoggerFactory.getLogger(SaktiTxAutoConfiguration.class);
-
     private final SaktiTxProperties properties;
 
     public SaktiTxAutoConfiguration(SaktiTxProperties properties) {
@@ -60,198 +66,97 @@ public class SaktiTxAutoConfiguration {
     @PostConstruct
     public void validateConfiguration() {
         log.info("═══════════════════════════════════════════════════════════");
-        log.info("SAKTI Transaction Coordinator v1.0.0 - Initializing...");
+        log.info("SAKTI Transaction Coordinator v2.0.0 - Initializing...");
         log.info("═══════════════════════════════════════════════════════════");
         
         boolean hasErrors = false;
 
         if (properties.getMultiDb().isEnabled()) {
-            log.info("Setting up automatic entity tracking with JPA listeners");
+            log.info("✓ Distributed Transaction: ENABLED");
+            log.info("  → Auto-tracking with JPA event listeners");
+            log.info("  → Pre-commit validation");
+            log.info("  → Smart compensation with circuit breaker");
         }
         
-        // Validate Dragonfly-dependent features
         if (!properties.getDragonfly().isEnabled()) {
             if (properties.getLock().isEnabled()) {
-                log.error("CONFIGURATION ERROR: sakti.tx.lock.enabled=true requires sakti.tx.dragonfly.enabled=true");
-                log.error("   → Solution: Set sakti.tx.dragonfly.enabled=true OR sakti.tx.lock.enabled=false");
+                log.error("❌ CONFIG ERROR: lock requires dragonfly.enabled=true");
                 hasErrors = true;
             }
             if (properties.getCache().isEnabled()) {
-                log.error("CONFIGURATION ERROR: sakti.tx.cache.enabled=true requires sakti.tx.dragonfly.enabled=true");
-                log.error("   → Solution: Set sakti.tx.dragonfly.enabled=true OR sakti.tx.cache.enabled=false");
+                log.error("❌ CONFIG ERROR: cache requires dragonfly.enabled=true");
                 hasErrors = true;
             }
             if (properties.getIdempotency().isEnabled()) {
-                log.error("CONFIGURATION ERROR: sakti.tx.idempotency.enabled=true requires sakti.tx.dragonfly.enabled=true");
-                log.error("   → Solution: Set sakti.tx.dragonfly.enabled=true OR sakti.tx.idempotency.enabled=false");
+                log.error("❌ CONFIG ERROR: idempotency requires dragonfly.enabled=true");
                 hasErrors = true;
             }
             if (properties.getMultiDb().isEnabled()) {
-                log.error("CONFIGURATION ERROR: sakti.tx.multi-db.enabled=true requires sakti.tx.dragonfly.enabled=true");
+                log.error("❌ CONFIG ERROR: multi-db requires dragonfly.enabled=true");
                 hasErrors = true;
-            }
-            if (!hasErrors) {
-                log.warn("Dragonfly is DISABLED - lock/cache/idempotency features will not work");
             }
         }
         
         if (hasErrors) {
             log.error("═══════════════════════════════════════════════════════════");
-            log.error("APPLICATION STARTUP WILL FAIL DUE TO CONFIGURATION ERRORS");
+            log.error("❌ APPLICATION STARTUP WILL FAIL - FIX CONFIGURATION");
             log.error("═══════════════════════════════════════════════════════════");
         }
         
-        logFeatureStatus("Dragonfly/Redis", properties.getDragonfly().isEnabled(), 
-            properties.getDragonfly().isEnabled() ? maskUrl(properties.getDragonfly().getUrl()) : "disabled");
-        logFeatureStatus("Distributed Transaction", properties.getMultiDb().isEnabled(), 
-            properties.getMultiDb().getRollbackStrategy().toString());
-        if (properties.getMultiDb().isEnabled()) {
-            logFeatureStatus("  → Recovery Worker", 
-                properties.getMultiDb().getRecovery().isEnabled(),
-                String.format("scan=%dms, timeout=%dms", 
-                    properties.getMultiDb().getRecovery().getScanIntervalMs(),
-                    properties.getMultiDb().getRecovery().getStallTimeoutMs()));
-            logFeatureStatus("  → Admin API", 
-                properties.getMultiDb().getAdminApi().isEnabled(),
-                "endpoints: /admin/transactions/*");
-        }
-        logFeatureStatus("Distributed Lock", properties.getLock().isEnabled(), 
-            getDependencyStatus(properties.getLock().isEnabled(), properties.getDragonfly().isEnabled()));
-        logFeatureStatus("Cache Manager", properties.getCache().isEnabled(), 
-            getDependencyStatus(properties.getCache().isEnabled(), properties.getDragonfly().isEnabled()));
-        logFeatureStatus("Idempotency", properties.getIdempotency().isEnabled(), 
-            getDependencyStatus(properties.getIdempotency().isEnabled(), properties.getDragonfly().isEnabled()));
-        logFeatureStatus("Circuit Breaker", properties.getCircuitBreaker().isEnabled(), 
-            "threshold=" + properties.getCircuitBreaker().getFailureThreshold());
-        logFeatureStatus("JMS Events", properties.getJms().isEnabled(), 
-            properties.getJms().isEnabled() ? "enabled" : "disabled");
-        logFeatureStatus("Health Indicator", properties.getHealth().isEnabled(), "actuator");
+        logFeatureStatus("Dragonfly/Redis", properties.getDragonfly().isEnabled());
+        logFeatureStatus("Distributed Transaction", properties.getMultiDb().isEnabled());
+        logFeatureStatus("Distributed Lock", properties.getLock().isEnabled());
+        logFeatureStatus("Cache Manager", properties.getCache().isEnabled());
+        logFeatureStatus("Idempotency", properties.getIdempotency().isEnabled());
+        logFeatureStatus("Circuit Breaker", properties.getCircuitBreaker().isEnabled());
+        logFeatureStatus("Pre-Commit Validation", properties.getValidation().isEnabled());
+        logFeatureStatus("Observability Metrics", properties.getObservability().isMetricsEnabled());
         log.info("═══════════════════════════════════════════════════════════");
     }
     
-    private void logFeatureStatus(String feature, boolean enabled, String detail) {
-        if (enabled) {
-            log.info("{} - ENABLED ({})", feature, detail);
-        } else {
-            log.info("{} - DISABLED", feature);
-        }
+    private void logFeatureStatus(String feature, boolean enabled) {
+        log.info("{}: {}", feature, enabled ? "✓ ENABLED" : "○ DISABLED");
     }
-    
-    private String getDependencyStatus(boolean featureEnabled, boolean dragonflyEnabled) {
-        if (!featureEnabled) return "disabled";
-        if (!dragonflyEnabled) return "REQUIRES DRAGONFLY";
-        return "ready";
-    }
-    
-    private String maskUrl(String url) {
-        if (url == null || !url.contains("@")) return url;
-        return url.replaceAll("://:[^@]+@", "://****@");
-    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CORE BEANS
+    // ═══════════════════════════════════════════════════════════════════════════
 
     @Bean
     @Order(0)
     public ObjectMapper saktiTxObjectMapper() {
-        log.debug("Creating ObjectMapper with JSR-310 support");
-        
         ObjectMapper mapper = new ObjectMapper();
+        mapper.registerModule(new JavaTimeModule());
+        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+        mapper.findAndRegisterModules();
         
-        try {
-            mapper.registerModule(new JavaTimeModule());
-            mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
-            mapper.findAndRegisterModules();
-            log.debug("Registered modules: {}", mapper.getRegisteredModuleIds());
-            
-            validateInstantSerialization(mapper);
-            
-            EntityOperationListener.setObjectMapper(mapper);
-            
-            return mapper;
-            
-        } catch (Exception e) {
-            log.error("═══════════════════════════════════════════════════════════");
-            log.error("CRITICAL ERROR: Failed to configure ObjectMapper");
-            log.error("═══════════════════════════════════════════════════════════");
-            log.error("Error: {}", e.getMessage(), e);
-            log.error("");
-            log.error("This will cause ALL transaction logging to FAIL!");
-            log.error("Solution: Add to pom.xml:");
-            log.error("  <dependency>");
-            log.error("    <groupId>com.fasterxml.jackson.datatype</groupId>");
-            log.error("    <artifactId>jackson-datatype-jsr310</artifactId>");
-            log.error("  </dependency>");
-            log.error("═══════════════════════════════════════════════════════════");
-            throw new IllegalStateException("Cannot configure ObjectMapper for transaction logging", e);
-        }
-    }
-    
-    /**
-     * Validate that ObjectMapper can serialize/deserialize Instant
-     */
-    private void validateInstantSerialization(ObjectMapper mapper) {
-        try {
-            java.time.Instant now = java.time.Instant.now();
-            
-            String json = mapper.writeValueAsString(now);
-            log.debug("Instant serialization test: {} → {}", now, json);
-            
-            // Test deserialization
-            java.time.Instant parsed = mapper.readValue(json, java.time.Instant.class);
-            log.debug("Instant deserialization test: {} → {}", json, parsed);
-            
-        } catch (Exception e) {
-            log.error("═══════════════════════════════════════════════════════════");
-            log.error("CRITICAL: Instant serialization validation FAILED");
-            log.error("═══════════════════════════════════════════════════════════");
-            log.error("Error: {}", e.getMessage());
-            log.error("");
-            log.error("Possible causes:");
-            log.error("  1. jackson-datatype-jsr310 not in classpath");
-            log.error("  2. JavaTimeModule not registered properly");
-            log.error("  3. Incompatible Jackson version");
-            log.error("");
-            log.error("Add to pom.xml:");
-            log.error("  <dependency>");
-            log.error("    <groupId>com.fasterxml.jackson.datatype</groupId>");
-            log.error("    <artifactId>jackson-datatype-jsr310</artifactId>");
-            log.error("  </dependency>");
-            log.error("═══════════════════════════════════════════════════════════");
-            
-            throw new IllegalStateException(
-                "ObjectMapper cannot serialize/deserialize Instant - JSR-310 module not working", 
-                e
-            );
-        }
+        EntityOperationListener.setObjectMapper(mapper);
+        
+        log.info("✓ ObjectMapper with JSR-310 support created");
+        return mapper;
     }
 
     @Bean(destroyMethod = "shutdown")
     @ConditionalOnMissingBean(RedissonClient.class)
     @ConditionalOnProperty(prefix = "sakti.tx.dragonfly", name = "enabled", havingValue = "true")
     public RedissonClient redissonClient(SaktiTxProperties properties) {
-        log.info("Creating RedissonClient: {}", maskUrl(properties.getDragonfly().getUrl()));
+        Config config = new Config();
+        config.useSingleServer()
+                .setAddress(properties.getDragonfly().getUrl())
+                .setPassword(properties.getDragonfly().getPassword().isEmpty() ? null
+                        : properties.getDragonfly().getPassword())
+                .setConnectionPoolSize(properties.getDragonfly().getPool().getSize())
+                .setConnectionMinimumIdleSize(properties.getDragonfly().getPool().getMinIdle())
+                .setTimeout(properties.getDragonfly().getTimeout())
+                .setConnectTimeout(properties.getDragonfly().getConnectTimeout())
+                .setRetryAttempts(3)
+                .setRetryInterval(1500);
 
-        try {
-            Config config = new Config();
-            config.useSingleServer()
-                    .setAddress(properties.getDragonfly().getUrl())
-                    .setPassword(properties.getDragonfly().getPassword().isEmpty() ? null
-                            : properties.getDragonfly().getPassword())
-                    .setConnectionPoolSize(properties.getDragonfly().getPool().getSize())
-                    .setConnectionMinimumIdleSize(properties.getDragonfly().getPool().getMinIdle())
-                    .setTimeout(properties.getDragonfly().getTimeout())
-                    .setConnectTimeout(properties.getDragonfly().getConnectTimeout())
-                    .setRetryAttempts(3)
-                    .setRetryInterval(1500);
-
-            RedissonClient client = Redisson.create(config);
-            client.getKeys().count();
-            
-            log.info("RedissonClient created successfully");
-            return client;
-        } catch (Exception e) {
-            log.error("Failed to create RedissonClient: {}", e.getMessage());
-            log.error("   → Check Dragonfly connectivity: {}", maskUrl(properties.getDragonfly().getUrl()));
-            throw new IllegalStateException("Cannot initialize Dragonfly connection: " + e.getMessage(), e);
-        }
+        RedissonClient client = Redisson.create(config);
+        client.getKeys().count();
+        
+        log.info("✓ RedissonClient created");
+        return client;
     }
 
     @Bean
@@ -259,7 +164,7 @@ public class SaktiTxAutoConfiguration {
     @ConditionalOnProperty(prefix = "sakti.tx.lock", name = "enabled", havingValue = "true")
     @ConditionalOnBean(RedissonClient.class)
     public LockManager lockManager(RedissonClient redissonClient) {
-        log.info("Creating LockManager");
+        log.info("✓ LockManager created");
         return new RedissonLockManager(redissonClient);
     }
 
@@ -269,7 +174,7 @@ public class SaktiTxAutoConfiguration {
     public IdempotencyManager idempotencyManager(
             RedissonClient redissonClient,
             SaktiTxProperties properties) {
-        log.info("Creating IdempotencyManager (prefix: {})", properties.getIdempotency().getPrefix());
+        log.info("✓ IdempotencyManager created");
         return new IdempotencyManager(redissonClient, properties.getIdempotency().getPrefix());
     }
 
@@ -281,7 +186,7 @@ public class SaktiTxAutoConfiguration {
             RedissonClient redissonClient,
             @Qualifier("saktiTxObjectMapper") ObjectMapper saktiTxObjectMapper,
             SaktiTxProperties properties) {
-        log.info("Creating CacheManager (prefix: {})", properties.getCache().getPrefix());
+        log.info("✓ CacheManager created");
         return new CacheManager(redissonClient, saktiTxObjectMapper, properties.getCache().getPrefix());
     }
 
@@ -293,9 +198,13 @@ public class SaktiTxAutoConfiguration {
     public DragonflyHealthIndicator dragonflyHealthIndicator(
             RedissonClient redissonClient,
             SaktiTxProperties properties) {
-        log.info("Creating DragonflyHealthIndicator");
+        log.info("✓ DragonflyHealthIndicator created");
         return new DragonflyHealthIndicator(redissonClient, properties);
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ASPECT BEANS
+    // ═══════════════════════════════════════════════════════════════════════════
 
     @Bean
     @ConditionalOnMissingBean(SaktiLockAspect.class)
@@ -305,7 +214,7 @@ public class SaktiTxAutoConfiguration {
             LockManager lockManager,
             SaktiTxProperties properties,
             @Autowired(required = false) RedissonClient redissonClient) {
-        log.info("Creating SaktiLockAspect");
+        log.info("✓ SaktiLockAspect created");
         return new SaktiLockAspect(lockManager, properties, redissonClient);
     }
 
@@ -317,7 +226,7 @@ public class SaktiTxAutoConfiguration {
             CacheManager saktiCacheManager,
             SaktiTxProperties properties,
             @Autowired(required = false) RedissonClient redissonClient) {
-        log.info("Creating SaktiCacheAspect");
+        log.info("✓ SaktiCacheAspect created");
         return new SaktiCacheAspect(saktiCacheManager, properties, redissonClient);
     }
 
@@ -329,7 +238,7 @@ public class SaktiTxAutoConfiguration {
             SaktiTxProperties properties,
             @Autowired(required = false) IdempotencyManager idempotencyManager,
             @Autowired(required = false) RedissonClient redissonClient) {
-        log.info("Creating SaktiIdempotentAspect");
+        log.info("✓ SaktiIdempotentAspect created");
         return new SaktiIdempotentAspect(properties, idempotencyManager, redissonClient);
     }
 
@@ -347,21 +256,53 @@ public class SaktiTxAutoConfiguration {
         
         try {
             idempotencyManager = applicationContext.getBean(IdempotencyManager.class);
-            log.info("DistributedLockService - IdempotencyManager available");
         } catch (Exception e) {
-            log.info("DistributedLockService - IdempotencyManager not available (lock-only mode)");
+            log.debug("IdempotencyManager not available");
         }
         
         try {
             healthIndicator = applicationContext.getBean(DragonflyHealthIndicator.class);
-            log.info("DistributedLockService - DragonflyHealthIndicator available");
         } catch (Exception e) {
-            log.info("DistributedLockService - DragonflyHealthIndicator not available");
+            log.debug("DragonflyHealthIndicator not available");
         }
         
-        log.info("Creating DistributedLockService");
+        log.info("✓ DistributedLockService created");
         return new DistributedLockServiceImpl(lockManager, idempotencyManager, healthIndicator, properties);
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ✅ NEW: OBSERVABILITY & METRICS BEANS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    @Bean
+    @ConditionalOnMissingBean(TransactionMetrics.class)
+    @ConditionalOnProperty(prefix = "sakti.tx.observability", name = "metrics-enabled", havingValue = "true", matchIfMissing = true)
+    public TransactionMetrics transactionMetrics() {
+        log.info("✓ TransactionMetrics created");
+        return new TransactionMetrics();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ✅ NEW: CIRCUIT BREAKER BEAN
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    @Bean
+    @ConditionalOnMissingBean(CompensationCircuitBreaker.class)
+    @ConditionalOnProperty(prefix = "sakti.tx.circuit-breaker", name = "enabled", havingValue = "true", matchIfMissing = true)
+    public CompensationCircuitBreaker compensationCircuitBreaker(SaktiTxProperties properties) {
+        log.info("✓ CompensationCircuitBreaker created");
+        log.info("  → Failure Threshold: {}", properties.getCircuitBreaker().getCompensationFailureThreshold());
+        log.info("  → Recovery Window: {}ms", properties.getCircuitBreaker().getCompensationRecoveryWindowMs());
+        
+        return new CompensationCircuitBreaker(
+            properties.getCircuitBreaker().getCompensationFailureThreshold(),
+            Duration.ofMillis(properties.getCircuitBreaker().getCompensationRecoveryWindowMs())
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DISTRIBUTED TRANSACTION BEANS
+    // ═══════════════════════════════════════════════════════════════════════════
 
     @Bean
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
@@ -371,30 +312,10 @@ public class SaktiTxAutoConfiguration {
             @Qualifier("saktiTxObjectMapper") ObjectMapper saktiTxObjectMapper,
             SaktiTxProperties properties) {
         
-        log.info("Creating TransactionLogManager");
-        
-        try {
-            java.time.Instant test = java.time.Instant.now();
-            String json = saktiTxObjectMapper.writeValueAsString(test);
-            saktiTxObjectMapper.readValue(json, java.time.Instant.class);
-            log.debug("✓ ObjectMapper validation passed for TransactionLogManager");
-        } catch (Exception e) {
-            log.error("═══════════════════════════════════════════════════════════");
-            log.error("CRITICAL: ObjectMapper validation FAILED in TransactionLogManager {}", e);
-            log.error("═══════════════════════════════════════════════════════════");
-            throw new IllegalStateException("ObjectMapper not properly configured", e);
-        }
-        
         boolean waitForSync = properties.getDragonfly().isWaitForSync();
         int waitTimeoutMs = properties.getDragonfly().getWaitForSyncTimeoutMs();
         
-        if (waitForSync) {
-            log.info("   WAIT-FOR-SYNC: ENABLED (timeout: {}ms)", waitTimeoutMs);
-            log.info("   Transaction logs will wait for disk sync (higher durability, slight latency)");
-        } else {
-            log.info("   WAIT-FOR-SYNC: DISABLED (better performance, lower durability guarantee)");
-            log.info("   Enable with: sakti.tx.dragonfly.wait-for-sync=true");
-        }
+        log.info("✓ TransactionLogManager created (wait-for-sync: {})", waitForSync);
         
         return new TransactionLogManager(redissonClient, saktiTxObjectMapper, waitForSync, waitTimeoutMs);
     }
@@ -405,31 +326,24 @@ public class SaktiTxAutoConfiguration {
     public RedisDurabilityVerifier redisDurabilityVerifier(
             RedissonClient redissonClient,
             SaktiTxProperties properties) {
-        log.info("Creating RedisDurabilityVerifier");
+        log.info("✓ RedisDurabilityVerifier created");
         return new RedisDurabilityVerifier(redissonClient, properties);
     }
     
     @Bean
     @ConditionalOnMissingBean(EntityManagerDatasourceMapper.class)
     public EntityManagerDatasourceMapper entityManagerDatasourceMapper(ApplicationContext ctx) {
-        log.info("Creating EntityManagerDatasourceMapper");
+        log.info("✓ EntityManagerDatasourceMapper created");
         
         EntityManagerDatasourceMapper mapper = new EntityManagerDatasourceMapper();
         
-        // Auto-register all EntityManager beans
         Map<String, EntityManager> emBeans = ctx.getBeansOfType(EntityManager.class);
         for (Map.Entry<String, EntityManager> entry : emBeans.entrySet()) {
-            String beanName = entry.getKey();
-            EntityManager em = entry.getValue();
-            
-            // Extract datasource name from bean name
-            String datasourceName = extractDatasourceName(beanName);
-            mapper.registerEntityManager(datasourceName, em);
-            
-            log.info("Auto-registered EntityManager: {} -> {}", datasourceName, beanName);
+            String datasourceName = extractDatasourceName(entry.getKey());
+            mapper.registerEntityManager(datasourceName, entry.getValue());
+            log.info("  → Registered: {} -> {}", datasourceName, entry.getKey());
         }
         
-        // Also check EntityManagerFactory beans for better detection
         Map<String, LocalContainerEntityManagerFactoryBean> emfBeans = 
             ctx.getBeansOfType(LocalContainerEntityManagerFactoryBean.class);
         
@@ -439,92 +353,61 @@ public class SaktiTxAutoConfiguration {
                 EntityManager em = entry.getValue().getObject().createEntityManager();
                 String datasourceName = extractDatasourceName(beanName);
                 
-                // Only register if not already registered
                 if (mapper.getAllEntityManagers().get(datasourceName) == null) {
                     mapper.registerEntityManager(datasourceName, em);
-                    log.info("Auto-registered EntityManager from factory: {} -> {}", 
-                        datasourceName, beanName);
+                    log.info("  → Registered from factory: {}", datasourceName);
                 }
             } catch (Exception e) {
-                log.warn("Could not create EntityManager from factory: {}", entry.getKey());
+                log.warn("Could not create EM from factory: {}", entry.getKey());
             }
         }
         
         return mapper;
     }
 
-    /**
-     * CRITICAL: Transaction Metrics Bean
-     */
-    @Bean
-    @ConditionalOnMissingBean(TransactionMetrics.class)
-    @ConditionalOnProperty(prefix = "sakti.tx.observability", name = "metrics-enabled", havingValue = "true", matchIfMissing = true)
-    public TransactionMetrics transactionMetrics() {
-        log.info("✓ Creating TransactionMetrics bean");
-        return new TransactionMetrics();
-    }
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ✅ NEW: RISK DETECTION BEANS
+    // ═══════════════════════════════════════════════════════════════════════════
 
-    /**
-     * CRITICAL: Compensation Circuit Breaker Bean
-     */
-    @Bean
-    @ConditionalOnMissingBean(CompensationCircuitBreaker.class)
-    @ConditionalOnProperty(prefix = "sakti.tx.circuit-breaker", name = "enabled", havingValue = "true", matchIfMissing = true)
-    public CompensationCircuitBreaker compensationCircuitBreaker(SaktiTxProperties properties) {
-        log.info("✓ Creating CompensationCircuitBreaker bean");
-        log.info("  → Failure Threshold: {}", properties.getCircuitBreaker().getCompensationFailureThreshold());
-        log.info("  → Recovery Window: {}ms", properties.getCircuitBreaker().getCompensationRecoveryWindowMs());
-        
-        return new CompensationCircuitBreaker(
-            properties.getCircuitBreaker().getCompensationFailureThreshold(),
-            Duration.ofMillis(properties.getCircuitBreaker().getCompensationRecoveryWindowMs())
-        );
-    }
-
-    /**
-     * CRITICAL: Trigger Detector Bean
-     */
     @Bean
     @ConditionalOnMissingBean(TriggerDetector.class)
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
     public TriggerDetector triggerDetector(EntityManagerDatasourceMapper mapper) {
-        log.info("✓ Creating TriggerDetector bean");
+        log.info("✓ TriggerDetector created");
         Map<String, EntityManager> entityManagers = mapper.getAllEntityManagers();
         TriggerDetector detector = new TriggerDetector(entityManagers);
         
-        // Set static field di EntityOperationListener
+        // Set static field in EntityOperationListener
         EntityOperationListener.setTriggerDetector(detector);
         
         return detector;
     }
 
-    /**
-     * CRITICAL: Cascade Detector Bean
-     */
     @Bean
     @ConditionalOnMissingBean(CascadeDetector.class)
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
     public CascadeDetector cascadeDetector(EntityManagerDatasourceMapper mapper) {
-        log.info("✓ Creating CascadeDetector bean");
+        log.info("✓ CascadeDetector created");
         Map<String, EntityManager> entityManagers = mapper.getAllEntityManagers();
         CascadeDetector detector = new CascadeDetector(entityManagers);
         
-        // Set static field di EntityOperationListener
+        // Set static field in EntityOperationListener
         EntityOperationListener.setCascadeDetector(detector);
         
         return detector;
     }
 
-    /**
-     * CRITICAL: Pre-Commit Validator Bean
-     */
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ✅ NEW: PRE-COMMIT VALIDATION BEAN
+    // ═══════════════════════════════════════════════════════════════════════════
+
     @Bean
     @ConditionalOnMissingBean(PreCommitValidator.class)
     @ConditionalOnProperty(prefix = "sakti.tx.validation", name = "enabled", havingValue = "true", matchIfMissing = true)
     public PreCommitValidator preCommitValidator(
             EntityManagerDatasourceMapper mapper,
             SaktiTxProperties properties) {
-        log.info("✓ Creating PreCommitValidator bean");
+        log.info("✓ PreCommitValidator created");
         log.info("  → Long Running Threshold: {}ms", properties.getValidation().getLongRunningThresholdMs());
         log.info("  → Strict Version Check: {}", properties.getValidation().isStrictVersionCheck());
         
@@ -534,13 +417,14 @@ public class SaktiTxAutoConfiguration {
         return new DefaultPreCommitValidator(entityManagers, threshold);
     }
 
-    /**
-     * CRITICAL: Hibernate StatementInspector Registration
-     */
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ✅ NEW: HIBERNATE STATEMENT INSPECTOR REGISTRATION
+    // ═══════════════════════════════════════════════════════════════════════════
+
     @Bean
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
     public SaktiHibernateStatementInspectorRegistrar statementInspectorRegistrar() {
-        log.info("✓ Creating Hibernate StatementInspector Registrar");
+        log.info("✓ Hibernate StatementInspector Registrar created");
         return new SaktiHibernateStatementInspectorRegistrar();
     }
     
@@ -560,14 +444,18 @@ public class SaktiTxAutoConfiguration {
         return beanName;
     }
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ✅ MODIFIED: COMPENSATING TRANSACTION EXECUTOR (with circuit breaker)
+    // ═══════════════════════════════════════════════════════════════════════════
+    
     @Bean
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
     public CompensatingTransactionExecutor compensatingTransactionExecutor(
             EntityManagerDatasourceMapper mapper,
             @Qualifier("saktiTxObjectMapper") ObjectMapper saktiTxObjectMapper,
-            CompensationCircuitBreaker circuitBreaker,  // NEW
-            SaktiTxProperties properties) {  // NEW
-        log.info("Creating CompensatingTransactionExecutor");
+            CompensationCircuitBreaker circuitBreaker,
+            SaktiTxProperties properties) {
+        log.info("✓ CompensatingTransactionExecutor v2.0 created (with circuit breaker)");
         
         Map<String, EntityManager> entityManagers = mapper.getAllEntityManagers();
         boolean strictVersionCheck = properties.getValidation().isStrictVersionCheck();
@@ -575,8 +463,8 @@ public class SaktiTxAutoConfiguration {
         return new CompensatingTransactionExecutor(
             entityManagers, 
             saktiTxObjectMapper, 
-            circuitBreaker,  // NEW
-            strictVersionCheck  // NEW
+            circuitBreaker,
+            strictVersionCheck
         );
     }
 
@@ -587,32 +475,38 @@ public class SaktiTxAutoConfiguration {
             TransactionLogManager logManager,
             CompensatingTransactionExecutor compensator,
             SaktiTxProperties properties) {
-        log.info("Creating TransactionRecoveryWorker");
-        log.info("   Scan Interval: {}ms", properties.getMultiDb().getRecovery().getScanIntervalMs());
-        log.info("   Stall Timeout: {}ms", properties.getMultiDb().getRecovery().getStallTimeoutMs());
-        log.info("   Max Recovery Attempts: {}", properties.getMultiDb().getRecovery().getMaxRecoveryAttempts());
+        log.info("✓ TransactionRecoveryWorker created");
         return new TransactionRecoveryWorker(logManager, compensator, properties);
     }
 
-    // @Bean
-    // @ConditionalOnProperty(prefix = "sakti.tx.multi-db.admin-api", name = "enabled", havingValue = "true", matchIfMissing = true)
-    // @ConditionalOnBean({TransactionLogManager.class, CompensatingTransactionExecutor.class, TransactionRecoveryWorker.class})
-    // public TransactionAdminController transactionAdminController(
-    //         TransactionLogManager logManager,
-    //         CompensatingTransactionExecutor compensator,
-    //         TransactionRecoveryWorker recoveryWorker) {
-    //     log.info("Creating TransactionAdminController");
-    //     log.info("   Admin API endpoints available at: /admin/transactions/*");
-    //     log.info("   WARNING: Ensure proper authentication/authorization is configured");
-    //     return new TransactionAdminController(logManager, compensator, recoveryWorker);
-    // }
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ✅ NEW: ADMIN API BEAN (UNCOMMENTED)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    @Bean
+    @ConditionalOnProperty(prefix = "sakti.tx.multi-db.admin-api", name = "enabled", havingValue = "true")
+    @ConditionalOnBean({TransactionLogManager.class, CompensatingTransactionExecutor.class, TransactionRecoveryWorker.class})
+    public TransactionAdminController transactionAdminController(
+            TransactionLogManager logManager,
+            CompensatingTransactionExecutor compensator,
+            TransactionRecoveryWorker recoveryWorker) {
+        log.info("✓ TransactionAdminController created");
+        log.info("  → Admin API available at: /admin/transactions/*");
+        log.info("  ⚠ WARNING: Add Spring Security for production!");
+        return new TransactionAdminController(logManager, compensator, recoveryWorker);
+    }
     
     @Bean
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
-    public ServiceOperationInterceptor serviceOperationInterceptor(@Qualifier("saktiTxObjectMapper") ObjectMapper saktiTxObjectMapper) {
-        log.info("Creating ServiceOperationInterceptor");
+    public ServiceOperationInterceptor serviceOperationInterceptor(
+            @Qualifier("saktiTxObjectMapper") ObjectMapper saktiTxObjectMapper) {
+        log.info("✓ ServiceOperationInterceptor created");
         return new ServiceOperationInterceptor(saktiTxObjectMapper);
     }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ✅ MODIFIED: DISTRIBUTED TX ASPECT (with validation & metrics)
+    // ═══════════════════════════════════════════════════════════════════════════
     
     @Bean
     @ConditionalOnMissingBean(SaktiDistributedTxAspect.class)
@@ -623,22 +517,26 @@ public class SaktiTxAutoConfiguration {
             TransactionLogManager logManager,
             CompensatingTransactionExecutor compensator,
             EntityManagerDatasourceMapper emMapper,
-            PreCommitValidator preCommitValidator,  // NEW
-            TransactionMetrics metrics,  // NEW
+            PreCommitValidator preCommitValidator,
+            TransactionMetrics metrics,
             @Autowired(required = false) LockManager lockManager,
             @Autowired(required = false) Map<String, PlatformTransactionManager> transactionManagers) {
-        log.info("Creating SaktiDistributedTxAspect v2.0 (with validation & metrics)");
+        log.info("✓ SaktiDistributedTxAspect v2.0 created (with validation & metrics)");
         return new SaktiDistributedTxAspect(
             properties, 
             logManager, 
             compensator, 
             emMapper, 
             lockManager, 
-            preCommitValidator,  // NEW
-            metrics,  // NEW
+            preCommitValidator,
+            metrics,
             transactionManagers
         );
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // JMS EVENT PUBLISHER (OPTIONAL)
+    // ═══════════════════════════════════════════════════════════════════════════
 
     @Bean
     @ConditionalOnMissingBean(JmsEventPublisher.class)
@@ -647,187 +545,59 @@ public class SaktiTxAutoConfiguration {
             ApplicationContext applicationContext,
             SaktiTxProperties properties) {
         
-        log.info("═══════════════════════════════════════════════════════════");
-        log.info("JMS Event Publisher - Initialization");
-        log.info("═══════════════════════════════════════════════════════════");
-        
         Object connectionFactory = null;
-        String factorySource = null;
         
         try {
-            Class<?> connectionFactoryClass = null;
-            try {
-                connectionFactoryClass = Class.forName("jakarta.jms.ConnectionFactory");
-                log.debug("jakarta.jms.ConnectionFactory found in classpath");
-            } catch (ClassNotFoundException e) {
-                // Should not happen due to @ConditionalOnClass, but safety check
-                log.warn("jakarta.jms.ConnectionFactory not found");
-            }
-
-            if (connectionFactoryClass != null) {
-                // ═══════════════════════════════════════════════════════════════
-                // STEP 2: Try to use existing ConnectionFactory bean (if provided)
-                // ═══════════════════════════════════════════════════════════════
-                String existingBeanName = properties.getJms().getExistingFactoryBeanName();
-                if (existingBeanName != null && !existingBeanName.trim().isEmpty()) {
-                    try {
-                        connectionFactory = applicationContext.getBean(existingBeanName, connectionFactoryClass);
-                        factorySource = "existing bean: " + existingBeanName;
-                        log.info("Using existing ConnectionFactory: {}", existingBeanName);
-                    } catch (Exception e) {
-                        log.warn("Cannot find ConnectionFactory bean '{}': {}", 
-                            existingBeanName, e.getMessage());
-                    }
+            Class<?> connectionFactoryClass = Class.forName("jakarta.jms.ConnectionFactory");
+            
+            String existingBeanName = properties.getJms().getExistingFactoryBeanName();
+            if (existingBeanName != null && !existingBeanName.trim().isEmpty()) {
+                try {
+                    connectionFactory = applicationContext.getBean(existingBeanName, connectionFactoryClass);
+                    log.info("✓ Using existing ConnectionFactory: {}", existingBeanName);
+                } catch (Exception e) {
+                    log.warn("Cannot find ConnectionFactory bean '{}'", existingBeanName);
                 }
-                
-                // ═══════════════════════════════════════════════════════════════
-                // STEP 3: Try to get default ConnectionFactory bean
-                // ═══════════════════════════════════════════════════════════════
-                if (connectionFactory == null) {
-                    try {
-                        connectionFactory = applicationContext.getBean(connectionFactoryClass);
-                        factorySource = "default bean";
-                        log.info("Using default ConnectionFactory bean");
-                    } catch (Exception e) {
-                        log.debug("No default ConnectionFactory bean found");
-                    }
-                }   
             }
             
-            // ═══════════════════════════════════════════════════════════════
-            // STEP 4: Try to auto-create ActiveMQ ConnectionFactory
-            // ═══════════════════════════════════════════════════════════════
+            if (connectionFactory == null) {
+                try {
+                    connectionFactory = applicationContext.getBean(connectionFactoryClass);
+                    log.info("✓ Using default ConnectionFactory bean");
+                } catch (Exception e) {
+                    log.debug("No default ConnectionFactory bean found");
+                }
+            }
+            
             if (connectionFactory == null) {
                 String brokerUrl = properties.getJms().getBrokerUrl();
-                
-                if (brokerUrl == null || brokerUrl.trim().isEmpty()) {
-                    log.error("═══════════════════════════════════════════════════════════");
-                    log.error("JMS Configuration Error");
-                    log.error("═══════════════════════════════════════════════════════════");
-                    log.error("sakti.tx.jms.enabled=true but no ConnectionFactory available");
-                    log.error("");
-                    log.error("Solutions:");
-                    log.error("  1. Provide existing ConnectionFactory:");
-                    log.error("     sakti.tx.jms.existing-factory-bean-name=myConnectionFactory");
-                    log.error("");
-                    log.error("  2. Auto-create new ConnectionFactory:");
-                    log.error("     sakti.tx.jms.broker-url=tcp://localhost:61616");
-                    log.error("     (requires artemis-jakarta-client dependency)");
-                    log.error("");
-                    log.error("  3. Create your own ConnectionFactory bean");
-                    log.error("");
-                    log.error("  4. Disable JMS:");
-                    log.error("     sakti.tx.jms.enabled=false");
-                    log.error("═══════════════════════════════════════════════════════════");
-                    return null;
-                }
-                
-                // Try to create ActiveMQ ConnectionFactory
-                connectionFactory = createActiveMQConnectionFactory(brokerUrl, properties);
-                if (connectionFactory != null) {
-                    factorySource = "auto-created ActiveMQConnectionFactory: " + brokerUrl;
+                if (brokerUrl != null && !brokerUrl.trim().isEmpty()) {
+                    connectionFactory = createActiveMQConnectionFactory(brokerUrl, properties);
                 }
             }
             
-            // ═══════════════════════════════════════════════════════════════
-            // STEP 5: Validate and test connection
-            // ═══════════════════════════════════════════════════════════════
-            if (connectionFactory == null) {
-                log.error("Failed to obtain or create ConnectionFactory");
-                return null;
+            if (connectionFactory != null) {
+                log.info("✓ JmsEventPublisher created");
+                return new JmsEventPublisher(connectionFactory, properties);
             }
-            
-            log.info("ConnectionFactory obtained: {}", factorySource);
-            
-            // Optional: Test connection on startup
-            if (properties.getJms().isTestOnStartup()) {
-                if (!testJmsConnection(connectionFactory, factorySource)) {
-                    log.warn("JMS connection test failed - bean will still be created");
-                    log.warn("   JMS operations may fail at runtime");
-                } else {
-                    log.info("JMS connection test successful");
-                }
-            }
-            
-            // ═══════════════════════════════════════════════════════════════
-            // STEP 6: Create JmsEventPublisher bean
-            // ═══════════════════════════════════════════════════════════════
-            log.info("Creating JmsEventPublisher");
-            log.info("═══════════════════════════════════════════════════════════");
-            
-            return new JmsEventPublisher(connectionFactory, properties);
             
         } catch (Exception e) {
-            log.error("═══════════════════════════════════════════════════════════");
-            log.error("Unexpected error during JMS initialization");
-            log.error("═══════════════════════════════════════════════════════════");
-            log.error("Error: {}", e.getMessage(), e);
-            log.error("");
-            log.error("Suggestions:");
-            log.error("  • Check ActiveMQ/Artemis is running");
-            log.error("  • Verify broker URL is correct");
-            log.error("  • Ensure artemis-jakarta-client dependency is present");
-            log.error("  • Disable JMS if not needed: sakti.tx.jms.enabled=false");
-            log.error("═══════════════════════════════════════════════════════════");
-            return null;
+            log.error("Failed to create JmsEventPublisher: {}", e.getMessage());
         }
+        
+        return null;
     }
 
-    /**
-     * Create ActiveMQ Artemis ConnectionFactory using reflection
-     * 
-     * This method uses reflection to avoid hard dependency on artemis-jakarta-client.
-     * If the library is not in classpath, it will gracefully fail with clear instructions.
-     * 
-     * @return ConnectionFactory instance or null if creation failed
-     */
     private Object createActiveMQConnectionFactory(String brokerUrl, SaktiTxProperties properties) {
-        
-        log.info("Attempting to auto-create ActiveMQConnectionFactory...");
-        log.info("Broker URL: {}", brokerUrl);
-        
         try {
-            // ═══════════════════════════════════════════════════════════════
-            // Check if artemis-jakarta-client is available
-            // ═══════════════════════════════════════════════════════════════
-            Class<?> amqFactoryClass;
-            try {
-                amqFactoryClass = Class.forName(
-                    "org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory"
-                );
-                log.debug("ActiveMQ Artemis client found in classpath");
-            } catch (ClassNotFoundException e) {
-                log.error("═══════════════════════════════════════════════════════════");
-                log.error("ActiveMQ Artemis client NOT found in classpath");
-                log.error("═══════════════════════════════════════════════════════════");
-                log.error("Cannot auto-create ConnectionFactory without artemis-jakarta-client");
-                log.error("");
-                log.error("Add this dependency to your pom.xml:");
-                log.error("");
-                log.error("  <dependency>");
-                log.error("    <groupId>org.apache.activemq</groupId>");
-                log.error("    <artifactId>artemis-jakarta-client</artifactId>");
-                log.error("    <version>2.38.0</version>");
-                log.error("  </dependency>");
-                log.error("");
-                log.error("OR provide your own ConnectionFactory bean");
-                log.error("OR disable JMS: sakti.tx.jms.enabled=false");
-                log.error("═══════════════════════════════════════════════════════════");
-                return null;
-            }
+            Class<?> amqFactoryClass = Class.forName(
+                "org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory"
+            );
             
-            // ═══════════════════════════════════════════════════════════════
-            // Create ActiveMQConnectionFactory instance
-            // ═══════════════════════════════════════════════════════════════
             Object connectionFactory = amqFactoryClass
                 .getDeclaredConstructor(String.class)
                 .newInstance(brokerUrl);
             
-            log.info("Created ActiveMQConnectionFactory instance");
-            
-            // ═══════════════════════════════════════════════════════════════
-            // Set credentials if provided
-            // ═══════════════════════════════════════════════════════════════
             String user = properties.getJms().getUser();
             String password = properties.getJms().getPassword();
             
@@ -836,95 +606,14 @@ public class SaktiTxAutoConfiguration {
                     .invoke(connectionFactory, user);
                 amqFactoryClass.getMethod("setPassword", String.class)
                     .invoke(connectionFactory, password);
-                log.info("Set JMS credentials for user: {}", user);
             }
             
-            // ═══════════════════════════════════════════════════════════════
-            // Optional: Configure connection pool and other settings
-            // ═══════════════════════════════════════════════════════════════
-            try {
-                // Set reasonable defaults for production use
-                amqFactoryClass.getMethod("setConnectionTTL", long.class)
-                    .invoke(connectionFactory, 60000L); // 60 seconds
-                
-                amqFactoryClass.getMethod("setReconnectAttempts", int.class)
-                    .invoke(connectionFactory, -1); // Infinite reconnect
-                
-                amqFactoryClass.getMethod("setRetryInterval", long.class)
-                    .invoke(connectionFactory, 1000L); // 1 second
-                
-                log.debug("Configured ActiveMQ connection settings");
-            } catch (Exception e) {
-                // Non-critical - continue even if settings fail
-                log.debug("Could not configure advanced settings: {}", e.getMessage());
-            }
-            
-            log.info("ActiveMQConnectionFactory created successfully");
+            log.info("✓ ActiveMQConnectionFactory created");
             return connectionFactory;
             
         } catch (Exception e) {
-            log.error("═══════════════════════════════════════════════════════════");
-            log.error("Failed to create ActiveMQConnectionFactory");
-            log.error("═══════════════════════════════════════════════════════════");
-            log.error("Error: {}", e.getMessage());
-            log.error("Broker URL: {}", brokerUrl);
-            log.error("");
-            log.error("Possible causes:");
-            log.error("  • ActiveMQ/Artemis broker not running");
-            log.error("  • Incorrect broker URL format");
-            log.error("  • Network connectivity issues");
-            log.error("  • Authentication required but not provided");
-            log.error("");
-            log.error("Solutions:");
-            log.error("  • Verify broker is running: telnet host port");
-            log.error("  • Check URL format: tcp://host:port");
-            log.error("  • Provide credentials if needed:");
-            log.error("    sakti.tx.jms.user=admin");
-            log.error("    sakti.tx.jms.password=admin");
-            log.error("═══════════════════════════════════════════════════════════");
+            log.error("Failed to create ActiveMQConnectionFactory: {}", e.getMessage());
             return null;
-        }
-    }
-
-    /**
-     * Test JMS connection (optional but recommended)
-     * 
-     * @return true if connection successful, false otherwise
-     */
-    private boolean testJmsConnection(Object connectionFactory, String source) {
-        if (connectionFactory == null) {
-            return false;
-        }
-        
-        Object connection = null;
-        try {
-            log.debug("Testing JMS connection: {}", source);
-            
-            // Use reflection: connection = connectionFactory.createConnection()
-            Class<?> factoryClass = connectionFactory.getClass();
-            Object connectionObj = factoryClass.getMethod("createConnection").invoke(connectionFactory);
-            connection = connectionObj;
-            
-            // Use reflection: connection.start()
-            connectionObj.getClass().getMethod("start").invoke(connectionObj);
-            
-            log.info("JMS connection test successful");
-            return true;
-            
-        } catch (Exception e) {
-            log.error("JMS connection test failed: {}", e.getMessage());
-            log.error("   Verify broker is running and accessible");
-            return false;
-            
-        } finally {
-            if (connection != null) {
-                try {
-                    // Use reflection: connection.close()
-                    connection.getClass().getMethod("close").invoke(connection);
-                } catch (Exception e) {
-                    log.debug("Error closing test connection: {}", e.getMessage());
-                }
-            }
         }
     }
 }

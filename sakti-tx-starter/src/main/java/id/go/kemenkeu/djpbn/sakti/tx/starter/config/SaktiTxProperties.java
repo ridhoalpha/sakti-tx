@@ -109,20 +109,47 @@ public class SaktiTxProperties {
         private boolean enabled = true;
         private int failureThreshold = 5;
         private long recoveryTimeoutMs = 30000;
-        private int compensationFailureThreshold = 3; // NEW
-        private long compensationRecoveryWindowMs = 60000; // NEW
         
-        public boolean isEnabled() { return enabled; }
-        public void setEnabled(boolean enabled) { this.enabled = enabled; }
-        public int getFailureThreshold() { return failureThreshold; }
-        public void setFailureThreshold(int failureThreshold) { this.failureThreshold = failureThreshold; }
-        public long getRecoveryTimeoutMs() { return recoveryTimeoutMs; }
-        public void setRecoveryTimeoutMs(long recoveryTimeoutMs) { this.recoveryTimeoutMs = recoveryTimeoutMs; }
-        public int getCompensationFailureThreshold() { return compensationFailureThreshold; }
+        private int compensationFailureThreshold = 3;
+        private long compensationRecoveryWindowMs = 60000;
+        
+        // Existing getters/setters
+        public boolean isEnabled() { 
+            return enabled; 
+        }
+        
+        public void setEnabled(boolean enabled) { 
+            this.enabled = enabled; 
+        }
+        
+        public int getFailureThreshold() { 
+            return failureThreshold; 
+        }
+        
+        public void setFailureThreshold(int failureThreshold) { 
+            this.failureThreshold = failureThreshold; 
+        }
+        
+        public long getRecoveryTimeoutMs() { 
+            return recoveryTimeoutMs; 
+        }
+        
+        public void setRecoveryTimeoutMs(long recoveryTimeoutMs) { 
+            this.recoveryTimeoutMs = recoveryTimeoutMs; 
+        }
+        
+        public int getCompensationFailureThreshold() { 
+            return compensationFailureThreshold; 
+        }
+        
         public void setCompensationFailureThreshold(int compensationFailureThreshold) { 
             this.compensationFailureThreshold = compensationFailureThreshold; 
         }
-        public long getCompensationRecoveryWindowMs() { return compensationRecoveryWindowMs; }
+        
+        public long getCompensationRecoveryWindowMs() { 
+            return compensationRecoveryWindowMs; 
+        }
+        
         public void setCompensationRecoveryWindowMs(long compensationRecoveryWindowMs) { 
             this.compensationRecoveryWindowMs = compensationRecoveryWindowMs; 
         }
@@ -234,10 +261,12 @@ public class SaktiTxProperties {
         
         public boolean isEnabled() { return enabled; }
         public void setEnabled(boolean enabled) { this.enabled = enabled; }
+        
         public long getLongRunningThresholdMs() { return longRunningThresholdMs; }
         public void setLongRunningThresholdMs(long longRunningThresholdMs) { 
             this.longRunningThresholdMs = longRunningThresholdMs; 
         }
+        
         public boolean isStrictVersionCheck() { return strictVersionCheck; }
         public void setStrictVersionCheck(boolean strictVersionCheck) { 
             this.strictVersionCheck = strictVersionCheck; 
@@ -257,10 +286,12 @@ public class SaktiTxProperties {
         public void setMetricsEnabled(boolean metricsEnabled) { 
             this.metricsEnabled = metricsEnabled; 
         }
+        
         public boolean isTracingEnabled() { return tracingEnabled; }
         public void setTracingEnabled(boolean tracingEnabled) { 
             this.tracingEnabled = tracingEnabled; 
         }
+        
         public String getTracingServiceName() { return tracingServiceName; }
         public void setTracingServiceName(String tracingServiceName) { 
             this.tracingServiceName = tracingServiceName; 
