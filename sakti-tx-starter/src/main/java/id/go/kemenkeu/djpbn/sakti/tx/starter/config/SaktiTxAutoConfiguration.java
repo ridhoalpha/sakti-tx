@@ -452,6 +452,97 @@ public class SaktiTxAutoConfiguration {
         
         return mapper;
     }
+
+    /**
+     * CRITICAL: Transaction Metrics Bean
+     */
+    @Bean
+    @ConditionalOnMissingBean(TransactionMetrics.class)
+    @ConditionalOnProperty(prefix = "sakti.tx.observability", name = "metrics-enabled", havingValue = "true", matchIfMissing = true)
+    public TransactionMetrics transactionMetrics() {
+        log.info("✓ Creating TransactionMetrics bean");
+        return new TransactionMetrics();
+    }
+
+    /**
+     * CRITICAL: Compensation Circuit Breaker Bean
+     */
+    @Bean
+    @ConditionalOnMissingBean(CompensationCircuitBreaker.class)
+    @ConditionalOnProperty(prefix = "sakti.tx.circuit-breaker", name = "enabled", havingValue = "true", matchIfMissing = true)
+    public CompensationCircuitBreaker compensationCircuitBreaker(SaktiTxProperties properties) {
+        log.info("✓ Creating CompensationCircuitBreaker bean");
+        log.info("  → Failure Threshold: {}", properties.getCircuitBreaker().getCompensationFailureThreshold());
+        log.info("  → Recovery Window: {}ms", properties.getCircuitBreaker().getCompensationRecoveryWindowMs());
+        
+        return new CompensationCircuitBreaker(
+            properties.getCircuitBreaker().getCompensationFailureThreshold(),
+            Duration.ofMillis(properties.getCircuitBreaker().getCompensationRecoveryWindowMs())
+        );
+    }
+
+    /**
+     * CRITICAL: Trigger Detector Bean
+     */
+    @Bean
+    @ConditionalOnMissingBean(TriggerDetector.class)
+    @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
+    public TriggerDetector triggerDetector(EntityManagerDatasourceMapper mapper) {
+        log.info("✓ Creating TriggerDetector bean");
+        Map<String, EntityManager> entityManagers = mapper.getAllEntityManagers();
+        TriggerDetector detector = new TriggerDetector(entityManagers);
+        
+        // Set static field di EntityOperationListener
+        EntityOperationListener.setTriggerDetector(detector);
+        
+        return detector;
+    }
+
+    /**
+     * CRITICAL: Cascade Detector Bean
+     */
+    @Bean
+    @ConditionalOnMissingBean(CascadeDetector.class)
+    @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
+    public CascadeDetector cascadeDetector(EntityManagerDatasourceMapper mapper) {
+        log.info("✓ Creating CascadeDetector bean");
+        Map<String, EntityManager> entityManagers = mapper.getAllEntityManagers();
+        CascadeDetector detector = new CascadeDetector(entityManagers);
+        
+        // Set static field di EntityOperationListener
+        EntityOperationListener.setCascadeDetector(detector);
+        
+        return detector;
+    }
+
+    /**
+     * CRITICAL: Pre-Commit Validator Bean
+     */
+    @Bean
+    @ConditionalOnMissingBean(PreCommitValidator.class)
+    @ConditionalOnProperty(prefix = "sakti.tx.validation", name = "enabled", havingValue = "true", matchIfMissing = true)
+    public PreCommitValidator preCommitValidator(
+            EntityManagerDatasourceMapper mapper,
+            SaktiTxProperties properties) {
+        log.info("✓ Creating PreCommitValidator bean");
+        log.info("  → Long Running Threshold: {}ms", properties.getValidation().getLongRunningThresholdMs());
+        log.info("  → Strict Version Check: {}", properties.getValidation().isStrictVersionCheck());
+        
+        Map<String, EntityManager> entityManagers = mapper.getAllEntityManagers();
+        Duration threshold = Duration.ofMillis(properties.getValidation().getLongRunningThresholdMs());
+        
+        return new DefaultPreCommitValidator(entityManagers, threshold);
+    }
+
+    /**
+     * CRITICAL: Hibernate StatementInspector Registration
+     */
+    @Bean
+    @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
+    public SaktiHibernateStatementInspectorRegistrar statementInspectorRegistrar() {
+        log.info("✓ Creating Hibernate StatementInspector Registrar");
+        return new SaktiHibernateStatementInspectorRegistrar();
+    }
     
     private String extractDatasourceName(String beanName) {
         String lower = beanName.toLowerCase();
@@ -473,18 +564,20 @@ public class SaktiTxAutoConfiguration {
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
     public CompensatingTransactionExecutor compensatingTransactionExecutor(
             EntityManagerDatasourceMapper mapper,
-            @Qualifier("saktiTxObjectMapper") ObjectMapper saktiTxObjectMapper) {
+            @Qualifier("saktiTxObjectMapper") ObjectMapper saktiTxObjectMapper,
+            CompensationCircuitBreaker circuitBreaker,  // NEW
+            SaktiTxProperties properties) {  // NEW
         log.info("Creating CompensatingTransactionExecutor");
         
         Map<String, EntityManager> entityManagers = mapper.getAllEntityManagers();
+        boolean strictVersionCheck = properties.getValidation().isStrictVersionCheck();
         
-        if (entityManagers.isEmpty()) {
-            log.warn("No EntityManager beans found - compensating transactions may fail");
-        } else {
-            log.info("Found {} EntityManager beans", entityManagers.size());
-        }
-        
-        return new CompensatingTransactionExecutor(entityManagers, saktiTxObjectMapper);
+        return new CompensatingTransactionExecutor(
+            entityManagers, 
+            saktiTxObjectMapper, 
+            circuitBreaker,  // NEW
+            strictVersionCheck  // NEW
+        );
     }
 
     @Bean
@@ -530,10 +623,21 @@ public class SaktiTxAutoConfiguration {
             TransactionLogManager logManager,
             CompensatingTransactionExecutor compensator,
             EntityManagerDatasourceMapper emMapper,
+            PreCommitValidator preCommitValidator,  // NEW
+            TransactionMetrics metrics,  // NEW
             @Autowired(required = false) LockManager lockManager,
             @Autowired(required = false) Map<String, PlatformTransactionManager> transactionManagers) {
-        log.info("Creating SaktiDistributedTxAspect");
-        return new SaktiDistributedTxAspect(properties, logManager, compensator, emMapper, lockManager, transactionManagers);
+        log.info("Creating SaktiDistributedTxAspect v2.0 (with validation & metrics)");
+        return new SaktiDistributedTxAspect(
+            properties, 
+            logManager, 
+            compensator, 
+            emMapper, 
+            lockManager, 
+            preCommitValidator,  // NEW
+            metrics,  // NEW
+            transactionManagers
+        );
     }
 
     @Bean
