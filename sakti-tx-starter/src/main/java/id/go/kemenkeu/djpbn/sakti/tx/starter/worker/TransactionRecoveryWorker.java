@@ -1,6 +1,7 @@
 package id.go.kemenkeu.djpbn.sakti.tx.starter.worker;
 
 import id.go.kemenkeu.djpbn.sakti.tx.core.compensate.CompensatingTransactionExecutor;
+import id.go.kemenkeu.djpbn.sakti.tx.core.lock.LockManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.log.TransactionLog;
 import id.go.kemenkeu.djpbn.sakti.tx.core.log.TransactionLogManager;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.config.SaktiTxProperties;
@@ -19,18 +20,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Background worker untuk recovery stuck/failed transactions
+ * ENHANCED: Recovery worker with distributed lock to prevent race conditions
  * 
- * FEATURES:
- * - Scheduled scanning untuk IN_PROGRESS/ROLLING_BACK transactions
- * - Automatic completion untuk stalled transactions
- * - Metrics untuk monitoring
- * - Configurable scan interval dan timeout
- * 
- * SAFETY:
- * - Only processes transactions older than configured timeout
- * - Logs all recovery attempts
- * - Marks failed recoveries for manual intervention
+ * @version 2.0.0
  */
 @Component
 @ConditionalOnProperty(prefix = "sakti.tx.multi-db.recovery", name = "enabled", havingValue = "true", matchIfMissing = true)
@@ -38,9 +30,12 @@ public class TransactionRecoveryWorker {
     
     private static final Logger log = LoggerFactory.getLogger(TransactionRecoveryWorker.class);
     
+    private static final String RECOVERY_LOCK_KEY = "sakti:recovery:scan-lock";
+    
     private final TransactionLogManager logManager;
     private final CompensatingTransactionExecutor compensator;
     private final SaktiTxProperties properties;
+    private final LockManager lockManager;
     
     // Metrics
     private final AtomicLong totalRecoveryAttempts = new AtomicLong(0);
@@ -51,16 +46,18 @@ public class TransactionRecoveryWorker {
     
     public TransactionRecoveryWorker(TransactionLogManager logManager,
                                     CompensatingTransactionExecutor compensator,
-                                    SaktiTxProperties properties) {
+                                    SaktiTxProperties properties,
+                                    LockManager lockManager) {
         this.logManager = logManager;
         this.compensator = compensator;
         this.properties = properties;
+        this.lockManager = lockManager;
     }
     
     @PostConstruct
     public void init() {
         log.info("═══════════════════════════════════════════════════════════");
-        log.info("Transaction Recovery Worker INITIALIZED");
+        log.info("Transaction Recovery Worker INITIALIZED (v2.0 - with distributed lock)");
         log.info("Scan Interval: {}ms", properties.getMultiDb().getRecovery().getScanIntervalMs());
         log.info("Stall Timeout: {}ms", properties.getMultiDb().getRecovery().getStallTimeoutMs());
         log.info("Max Recovery Attempts: {}", properties.getMultiDb().getRecovery().getMaxRecoveryAttempts());
@@ -68,8 +65,7 @@ public class TransactionRecoveryWorker {
     }
     
     /**
-     * Scheduled task untuk scan stalled transactions
-     * Default: setiap 1 menit
+     * ENHANCED: Scheduled scan with distributed lock
      */
     @Scheduled(
         fixedDelayString = "${sakti.tx.multi-db.recovery.scan-interval-ms:60000}",
@@ -78,8 +74,22 @@ public class TransactionRecoveryWorker {
     public void scanAndRecoverStalledTransactions() {
         lastScanTime = Instant.now();
         
+        // ═══════════════════════════════════════════════════════════════
+        // CRITICAL: Acquire distributed lock to prevent race conditions
+        // ═══════════════════════════════════════════════════════════════
+        
+        LockManager.LockHandle lock = null;
+        
         try {
-            log.debug("Starting recovery scan...");
+            // Try to acquire lock (don't wait long - if another worker is scanning, skip)
+            lock = lockManager.tryLock(RECOVERY_LOCK_KEY, 100, 60000);
+            
+            if (!lock.isAcquired()) {
+                log.debug("Recovery scan already in progress by another worker - skipping");
+                return;
+            }
+            
+            log.debug("Acquired recovery lock - starting scan...");
             
             Duration stallTimeout = Duration.ofMillis(
                 properties.getMultiDb().getRecovery().getStallTimeoutMs()
@@ -106,6 +116,11 @@ public class TransactionRecoveryWorker {
             
         } catch (Exception e) {
             log.error("Recovery scan failed", e);
+        } finally {
+            if (lock != null && lock.isAcquired()) {
+                lock.release();
+                log.debug("Released recovery lock");
+            }
         }
     }
     
@@ -143,20 +158,17 @@ public class TransactionRecoveryWorker {
             switch (tx.getState()) {
                 case STARTED:
                 case IN_PROGRESS:
-                    // Transaction started but never completed - assume it failed
                     log.warn("Transaction {} stuck in {} state - forcing rollback", 
                         txId, tx.getState());
                     forceRollback(tx);
                     break;
                     
                 case ROLLING_BACK:
-                    // Rollback was started but not completed - retry rollback
                     log.warn("Transaction {} stuck in ROLLING_BACK - retrying rollback", txId);
                     retryRollback(tx);
                     break;
                     
                 case COMMITTING:
-                    // Commit in progress - this is problematic
                     log.error("Transaction {} stuck in COMMITTING state - POTENTIAL PARTIAL COMMIT", txId);
                     log.error("Manual verification required - cannot auto-recover");
                     logManager.markFailed(txId, "Stuck in COMMITTING state - manual verification required");
@@ -177,9 +189,6 @@ public class TransactionRecoveryWorker {
         }
     }
     
-    /**
-     * Force rollback untuk transaction yang stuck di STARTED state
-     */
     private void forceRollback(TransactionLog tx) {
         String txId = tx.getTxId();
         
@@ -208,9 +217,6 @@ public class TransactionRecoveryWorker {
         }
     }
     
-    /**
-     * Retry rollback untuk transaction yang stuck di ROLLING_BACK state
-     */
     private void retryRollback(TransactionLog tx) {
         String txId = tx.getTxId();
         
@@ -237,9 +243,6 @@ public class TransactionRecoveryWorker {
         }
     }
     
-    /**
-     * Log current metrics
-     */
     private void logMetrics() {
         log.info("═══════════════════════════════════════════════════════════");
         log.info("Recovery Worker Metrics:");
