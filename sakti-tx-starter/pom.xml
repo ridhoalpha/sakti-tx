@@ -45,6 +45,12 @@
             <artifactId>redisson-spring-boot-starter</artifactId>
             <optional>true</optional>
         </dependency>
+
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+            <optional>true</optional>
+        </dependency>
         
         <!-- OPTIONAL: Spring Data Redis (if needed for compatibility) -->
         <dependency>

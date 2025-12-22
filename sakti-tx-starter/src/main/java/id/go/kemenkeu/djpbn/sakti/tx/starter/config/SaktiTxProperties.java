@@ -201,6 +201,7 @@ public class SaktiTxProperties {
             private long initialDelayMs = 30000;
             private long stallTimeoutMs = 300000;
             private int maxRecoveryAttempts = 5;
+            private boolean requireDistributedLock = true;
             
             public boolean isEnabled() { return enabled; }
             public void setEnabled(boolean enabled) { this.enabled = enabled; }
@@ -213,6 +214,9 @@ public class SaktiTxProperties {
             public int getMaxRecoveryAttempts() { return maxRecoveryAttempts; }
             public void setMaxRecoveryAttempts(int maxRecoveryAttempts) { 
                 this.maxRecoveryAttempts = maxRecoveryAttempts; 
+            }
+            public boolean isRequireDistributedLock() {
+                return requireDistributedLock;
             }
         }
         

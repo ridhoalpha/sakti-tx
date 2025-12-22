@@ -92,6 +92,31 @@ sakti.tx.dragonfly.wait-for-sync=false
 sakti.tx.dragonfly.wait-for-sync-timeout-ms=5000
 
 # ═══════════════════════════════════════════════════════════════════════════
+# VALIDATION CONFIGURATION (ENHANCED)
+# ═══════════════════════════════════════════════════════════════════════════
+sakti.tx.validation.enabled=true
+sakti.tx.validation.long-running-threshold-ms=30000
+
+# STRICT MODE (RECOMMENDED FOR PRODUCTION)
+# When enabled:
+# - Version mismatch = HARD FAIL (no compensation)
+# - Business key mismatch = HARD FAIL
+# - Missing snapshot = HARD FAIL
+# When disabled (default):
+# - Best-effort compensation with warnings
+sakti.tx.validation.strict-version-check=true
+
+# SNAPSHOT OPTIMIZATION
+# Skip large fields (@Lob, strings > 10KB)
+sakti.tx.validation.smart-snapshot=true
+sakti.tx.validation.max-string-length=10000
+
+# RISK THRESHOLDS
+# Fail transaction if risk score exceeds threshold
+sakti.tx.validation.max-risk-score=50
+sakti.tx.validation.fail-on-critical-risk=true
+
+# ═══════════════════════════════════════════════════════════════════════════
 # PRODUCTION RECOMMENDATIONS
 # ═══════════════════════════════════════════════════════════════════════════
 # For production deployment with critical transactions:

@@ -68,6 +68,32 @@ public class TransactionRecoveryWorker {
         log.info("Stall Timeout: {}ms", properties.getMultiDb().getRecovery().getStallTimeoutMs());
         log.info("Max Recovery Attempts: {}", properties.getMultiDb().getRecovery().getMaxRecoveryAttempts());
         log.info("Distributed Lock: {}", lockManager != null ? "ENABLED" : "DISABLED");
+        
+        // VALIDATION: Check if distributed lock is required
+        if (properties.getMultiDb().getRecovery().isRequireDistributedLock() && lockManager == null) {
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("❌ CRITICAL CONFIGURATION ERROR");
+            log.error("═══════════════════════════════════════════════════════════");
+            log.error("Recovery worker requires distributed lock but LockManager is NULL");
+            log.error("");
+            log.error("RISK:");
+            log.error("  → Multiple recovery workers can process same transaction");
+            log.error("  → Race conditions in K8s multi-pod deployment");
+            log.error("  → Double compensation queries");
+            log.error("");
+            log.error("SOLUTION:");
+            log.error("  1. Enable distributed lock:");
+            log.error("     sakti.tx.lock.enabled=true");
+            log.error("  2. OR disable lock requirement (NOT RECOMMENDED for production):");
+            log.error("     sakti.tx.multi-db.recovery.require-distributed-lock=false");
+            log.error("═══════════════════════════════════════════════════════════");
+            
+            throw new IllegalStateException(
+                "Recovery worker requires distributed lock but LockManager is not available. " +
+                "Enable sakti.tx.lock.enabled=true or set sakti.tx.multi-db.recovery.require-distributed-lock=false"
+            );
+        }
+        
         log.info("═══════════════════════════════════════════════════════════");
     }
     
