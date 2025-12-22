@@ -55,7 +55,8 @@ public class ThreadLocalCleanupFilter implements Filter {
             boolean hadLeak = checkAndCleanLeakedContext();
             
             if (hadLeak) {
-                // TODO
+                log.warn("ThreadLocal leak detected before request - cleaned - thread: {} ({})", 
+                    threadId, threadName);
             }
             
             // Process request
@@ -72,6 +73,8 @@ public class ThreadLocalCleanupFilter implements Filter {
             
             // Final verification
             if (hasLeakedContext()) {
+                log.error("CRITICAL: ThreadLocal STILL leaked after cleanup - thread: {} ({})", 
+                    threadId, threadName);
                 // Emergency force cleanup
                 forceCleanupAll();
             }
@@ -97,7 +100,7 @@ public class ThreadLocalCleanupFilter implements Filter {
         boolean hasLeak = false;
         
         // Check EntityOperationListener context
-        if (EntityOperationListener.getContext() != null) {
+        if (EntityOperationListener.getOperationContext() != null) {
             hasLeak = true;
         }
         
@@ -132,18 +135,18 @@ public class ThreadLocalCleanupFilter implements Filter {
         
         // 1. EntityOperationListener context
         try {
-            if (EntityOperationListener.getContext() != null) {
-                EntityOperationListener.clearContext();
+            if (EntityOperationListener.getOperationContext() != null) {
+                EntityOperationListener.clearOperationContext();
                 hadData = true;
                 
                 // Double-check
-                if (EntityOperationListener.getContext() != null) {
+                if (EntityOperationListener.getOperationContext() != null) {
                     log.error("EntityOperationListener context STILL not cleared!");
                     
                     // Try direct manipulation (risky but necessary)
                     try {
                         java.lang.reflect.Field field = EntityOperationListener.class
-                            .getDeclaredField("CONTEXT");
+                            .getDeclaredField("OPERATION_CONTEXT");
                         field.setAccessible(true);
                         ThreadLocal<?> tl = (ThreadLocal<?>) field.get(null);
                         tl.remove();

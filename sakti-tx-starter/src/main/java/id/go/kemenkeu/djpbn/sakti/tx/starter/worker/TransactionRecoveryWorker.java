@@ -35,7 +35,7 @@ public class TransactionRecoveryWorker {
     private final TransactionLogManager logManager;
     private final CompensatingTransactionExecutor compensator;
     private final SaktiTxProperties properties;
-    private final LockManager lockManager;
+    private LockManager lockManager;
     
     // Metrics
     private final AtomicLong totalRecoveryAttempts = new AtomicLong(0);
@@ -46,11 +46,17 @@ public class TransactionRecoveryWorker {
     
     public TransactionRecoveryWorker(TransactionLogManager logManager,
                                     CompensatingTransactionExecutor compensator,
-                                    SaktiTxProperties properties,
-                                    LockManager lockManager) {
+                                    SaktiTxProperties properties) {
         this.logManager = logManager;
         this.compensator = compensator;
         this.properties = properties;
+        this.lockManager = null;
+    }
+    
+    /**
+     * Optional: Set LockManager after construction if available
+     */
+    public void setLockManager(LockManager lockManager) {
         this.lockManager = lockManager;
     }
     
@@ -61,6 +67,7 @@ public class TransactionRecoveryWorker {
         log.info("Scan Interval: {}ms", properties.getMultiDb().getRecovery().getScanIntervalMs());
         log.info("Stall Timeout: {}ms", properties.getMultiDb().getRecovery().getStallTimeoutMs());
         log.info("Max Recovery Attempts: {}", properties.getMultiDb().getRecovery().getMaxRecoveryAttempts());
+        log.info("Distributed Lock: {}", lockManager != null ? "ENABLED" : "DISABLED");
         log.info("═══════════════════════════════════════════════════════════");
     }
     
@@ -81,15 +88,19 @@ public class TransactionRecoveryWorker {
         LockManager.LockHandle lock = null;
         
         try {
-            // Try to acquire lock (don't wait long - if another worker is scanning, skip)
-            lock = lockManager.tryLock(RECOVERY_LOCK_KEY, 100, 60000);
-            
-            if (!lock.isAcquired()) {
-                log.debug("Recovery scan already in progress by another worker - skipping");
-                return;
+            // Try to acquire lock if LockManager available
+            if (lockManager != null) {
+                lock = lockManager.tryLock(RECOVERY_LOCK_KEY, 100, 60000);
+                
+                if (!lock.isAcquired()) {
+                    log.debug("Recovery scan already in progress by another worker - skipping");
+                    return;
+                }
+                
+                log.debug("Acquired recovery lock - starting scan...");
+            } else {
+                log.debug("LockManager not available - proceeding without distributed lock");
             }
-            
-            log.debug("Acquired recovery lock - starting scan...");
             
             Duration stallTimeout = Duration.ofMillis(
                 properties.getMultiDb().getRecovery().getStallTimeoutMs()

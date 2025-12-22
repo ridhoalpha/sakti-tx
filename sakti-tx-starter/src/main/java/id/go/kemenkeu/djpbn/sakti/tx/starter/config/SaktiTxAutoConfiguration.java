@@ -474,9 +474,20 @@ public class SaktiTxAutoConfiguration {
     public TransactionRecoveryWorker transactionRecoveryWorker(
             TransactionLogManager logManager,
             CompensatingTransactionExecutor compensator,
-            SaktiTxProperties properties) {
+            SaktiTxProperties properties,
+            @Autowired(required = false) LockManager lockManager) {
         log.info("✓ TransactionRecoveryWorker created");
-        return new TransactionRecoveryWorker(logManager, compensator, properties);
+        TransactionRecoveryWorker worker = new TransactionRecoveryWorker(logManager, compensator, properties);
+        
+        // Inject LockManager if available
+        if (lockManager != null) {
+            worker.setLockManager(lockManager);
+            log.info("  → LockManager injected for distributed scan coordination");
+        } else {
+            log.warn("  → LockManager not available - recovery scans will run without distributed lock");
+        }
+        
+        return worker;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
