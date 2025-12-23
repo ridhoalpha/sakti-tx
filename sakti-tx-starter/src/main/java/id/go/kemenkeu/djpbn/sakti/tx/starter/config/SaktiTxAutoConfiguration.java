@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import id.go.kemenkeu.djpbn.sakti.tx.core.cache.CacheManager;
+import id.go.kemenkeu.djpbn.sakti.tx.core.context.SaktiTxContextHolder;
 import id.go.kemenkeu.djpbn.sakti.tx.core.compensate.CompensatingTransactionExecutor;
 import id.go.kemenkeu.djpbn.sakti.tx.core.compensate.CompensationCircuitBreaker;
 import id.go.kemenkeu.djpbn.sakti.tx.core.idempotency.IdempotencyManager;
@@ -61,6 +62,15 @@ public class SaktiTxAutoConfiguration {
 
     public SaktiTxAutoConfiguration(SaktiTxProperties properties) {
         this.properties = properties;
+    }
+
+    @PostConstruct
+    public void registerShutdownHook() {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            log.info("Forcing ThreadLocal cleanup on shutdown...");
+            EntityOperationListener.clearOperationContext();
+            SaktiTxContextHolder.clear();
+        }));
     }
 
     @PostConstruct

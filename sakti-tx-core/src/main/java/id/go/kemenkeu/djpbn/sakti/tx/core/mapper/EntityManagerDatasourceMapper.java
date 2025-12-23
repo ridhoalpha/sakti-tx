@@ -21,7 +21,15 @@ public class EntityManagerDatasourceMapper {
     public void registerEntityManager(String datasourceName, EntityManager em) {
         emToDatasource.put(em, datasourceName);
         datasourceToEm.put(datasourceName, em);
-        log.info("Registered EntityManager: {} -> {}", datasourceName, em);
+        
+        if (!datasourceName.endsWith("TransactionManager")) {
+            String txManagerName = datasourceName + "TransactionManager";
+            datasourceToEm.put(txManagerName, em);
+            log.info("Registered EntityManager: {} -> {} (+ alias: {})", 
+                datasourceName, em, txManagerName);
+        } else {
+            log.info("Registered EntityManager: {} -> {}", datasourceName, em);
+        }
     }
     
     public String getDatasourceName(EntityManager em) {
@@ -36,6 +44,9 @@ public class EntityManagerDatasourceMapper {
                 name = extractDatasourceName(unitName);
                 emToDatasource.put(em, name);
                 
+                log.debug("Auto-detected datasource name: {} for persistence unit: {}", 
+                    name, unitName);
+                
             } catch (Exception e) {
                 log.warn("Cannot determine datasource name for EntityManager, using 'default'");
                 name = "default";
@@ -46,12 +57,41 @@ public class EntityManagerDatasourceMapper {
     
     public EntityManager getEntityManager(String datasourceName) {
         EntityManager em = datasourceToEm.get(datasourceName);
+        
         if (em == null) {
+            if (datasourceName.endsWith("TransactionManager")) {
+                String shortName = datasourceName.replace("TransactionManager", "");
+                em = datasourceToEm.get(shortName);
+                
+                if (em != null) {
+                    log.debug("Found EntityManager using short name: {} -> {}", 
+                        datasourceName, shortName);
+                    // Cache this lookup for next time
+                    datasourceToEm.put(datasourceName, em);
+                    return em;
+                }
+            }
+            
+            // Try adding "TransactionManager" suffix
+            if (!datasourceName.endsWith("TransactionManager")) {
+                String longName = datasourceName + "TransactionManager";
+                em = datasourceToEm.get(longName);
+                
+                if (em != null) {
+                    log.debug("Found EntityManager using long name: {} -> {}", 
+                        datasourceName, longName);
+                    // Cache this lookup for next time
+                    datasourceToEm.put(datasourceName, em);
+                    return em;
+                }
+            }
+            
             throw new IllegalStateException(
                 "No EntityManager registered for datasource: " + datasourceName + 
                 ". Available: " + datasourceToEm.keySet()
             );
         }
+        
         return em;
     }
     
@@ -60,13 +100,16 @@ public class EntityManagerDatasourceMapper {
     }
     
     private String extractDatasourceName(String persistenceUnitName) {
-        if (persistenceUnitName.contains("db1") || persistenceUnitName.contains("primary")) {
+        String lower = persistenceUnitName.toLowerCase();
+        
+        if (lower.contains("db1") || lower.contains("primary") || lower.contains("first")) {
             return "db1";
-        } else if (persistenceUnitName.contains("db2") || persistenceUnitName.contains("secondary")) {
+        } else if (lower.contains("db2") || lower.contains("secondary") || lower.contains("second")) {
             return "db2";
-        } else if (persistenceUnitName.contains("db3")) {
+        } else if (lower.contains("db3") || lower.contains("third")) {
             return "db3";
         }
+        
         return persistenceUnitName;
     }
 }

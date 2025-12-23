@@ -55,7 +55,7 @@ public class ThreadLocalCleanupFilter implements Filter {
             boolean hadLeak = checkAndCleanLeakedContext();
             
             if (hadLeak) {
-                log.warn("ThreadLocal leak detected before request - cleaned - thread: {} ({})", 
+                log.debug("ThreadLocal leak detected before request - cleaned - thread: {} ({})", 
                     threadId, threadName);
             }
             
@@ -73,7 +73,7 @@ public class ThreadLocalCleanupFilter implements Filter {
             
             // Final verification
             if (hasLeakedContext()) {
-                log.error("CRITICAL: ThreadLocal STILL leaked after cleanup - thread: {} ({})", 
+                log.debug("CRITICAL: ThreadLocal STILL leaked after cleanup - thread: {} ({})", 
                     threadId, threadName);
                 // Emergency force cleanup
                 forceCleanupAll();
@@ -141,7 +141,7 @@ public class ThreadLocalCleanupFilter implements Filter {
                 
                 // Double-check
                 if (EntityOperationListener.getOperationContext() != null) {
-                    log.error("EntityOperationListener context STILL not cleared!");
+                    log.debug("EntityOperationListener context STILL not cleared!");
                     
                     // Try direct manipulation (risky but necessary)
                     try {
