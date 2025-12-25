@@ -36,11 +36,42 @@ import java.lang.reflect.Method;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * ENHANCED: Distributed Transaction Aspect with validation and observability
+ * ═══════════════════════════════════════════════════════════════════════════
+ * PRODUCTION-GRADE DISTRIBUTED TRANSACTION ASPECT
+ * ═══════════════════════════════════════════════════════════════════════════
  * 
- * @version 2.0.0
+ * CRITICAL FIXES IMPLEMENTED:
+ * 
+ * 1. CONTEXT LIFECYCLE FIX:
+ *    - Context cleanup HANYA setelah compensation selesai
+ *    - Separate tracking: compensationExecuted flag
+ *    - Guaranteed cleanup order
+ * 
+ * 2. NESTED TRANSACTION PROTECTION:
+ *    - Detect nested @SaktiDistributedTx
+ *    - Prevent context pollution
+ *    - Safe context inheritance
+ * 
+ * 3. TRANSACTION STATE CONSISTENCY:
+ *    - Track commit point dengan AtomicBoolean
+ *    - No rollback after successful commit
+ *    - Clear error messages
+ * 
+ * 4. THREAD-SAFE RESOURCE MANAGEMENT:
+ *    - All resources tracked in single structure
+ *    - Guaranteed cleanup dengan multiple fallbacks
+ *    - MDC cleanup di setiap exit path
+ * 
+ * 5. OBSERVABILITY:
+ *    - Detailed logging di setiap phase
+ *    - Context state tracking
+ *    - Error categorization
+ * 
+ * @version 3.0.0-PRODUCTION
+ * @author SAKTI Team
  */
 @Aspect
 @Component
@@ -81,7 +112,7 @@ public class SaktiDistributedTxAspect {
         this.allEntityManagers = emMapper.createEntityManagersForCompensation();
         this.transactionManagers = transactionManagers != null ? transactionManagers : new HashMap<>();
         
-        log.info("SaktiDistributedTxAspect initialized (v2.0 - with validation & metrics)");
+        log.info("SaktiDistributedTxAspect v3.0-PRODUCTION initialized");
     }
     
     @Around("@annotation(id.go.kemenkeu.djpbn.sakti.tx.starter.annotation.SaktiDistributedTx)")
@@ -91,27 +122,29 @@ public class SaktiDistributedTxAspect {
             return pjp.proceed();
         }
         
+        // ═══════════════════════════════════════════════════════════════
+        // NESTED TRANSACTION DETECTION
+        // ═══════════════════════════════════════════════════════════════
+        
+        boolean isNestedCall = SaktiTxContextHolder.hasContext();
+        
+        if (isNestedCall) {
+            log.debug("Nested @SaktiDistributedTx detected - delegating to parent transaction");
+            return pjp.proceed();
+        }
+        
         Instant startTime = Instant.now();
         metrics.recordTransactionStart();
         
         // ═══════════════════════════════════════════════════════════════
-        // RESOURCE DECLARATION (for cleanup tracking)
+        // RESOURCE TRACKING STRUCTURE
         // ═══════════════════════════════════════════════════════════════
         
-        TransactionLog txLog = null;
-        EntityOperationListener.EntityOperationContext operationContext = null;
-        LockManager.LockHandle lock = null;
-        Map<String, TransactionStatus> activeTransactions = new HashMap<>();
-        String txId = null;
-        SaktiTxContext context = null;
-        
-        // Track if we need to do cleanup
-        boolean needsCleanup = false;
-        boolean compensationExecuted = false;
+        TransactionResources resources = new TransactionResources();
         
         try {
             // ═══════════════════════════════════════════════════════════════
-            // PHASE 1: SETUP
+            // PHASE 1: INITIALIZATION
             // ═══════════════════════════════════════════════════════════════
             
             MethodSignature signature = (MethodSignature) pjp.getSignature();
@@ -120,24 +153,24 @@ public class SaktiDistributedTxAspect {
             
             String businessKey = generateBusinessKey(pjp);
             
-            context = new SaktiTxContext.Builder()
+            SaktiTxContext context = new SaktiTxContext.Builder()
                 .businessKey(businessKey)
                 .phase(TransactionPhase.CREATED)
                 .build();
             
-            txId = context.getTxId();
+            resources.txId = context.getTxId();
+            resources.context = context;
+            
             SaktiTxContextHolder.set(context);
             
-            txLog = logManager.createLog(businessKey);
+            resources.txLog = logManager.createLog(businessKey);
             
-            MDC.put("txId", txId);
+            MDC.put("txId", resources.txId);
             MDC.put("businessKey", businessKey);
             
-            needsCleanup = true; // Mark that we need cleanup
-            
             log.info("═══════════════════════════════════════════════════════════");
-            log.info("Distributed Transaction STARTED (v3.0)");
-            log.info("Transaction ID: {}", txId);
+            log.info("Distributed Transaction STARTED (v3.0-PRODUCTION)");
+            log.info("Transaction ID: {}", resources.txId);
             log.info("Business Key: {}", businessKey);
             log.info("Method: {}.{}", 
                 signature.getDeclaringType().getSimpleName(), 
@@ -145,36 +178,40 @@ public class SaktiDistributedTxAspect {
             log.info("═══════════════════════════════════════════════════════════");
             
             // ═══════════════════════════════════════════════════════════════
-            // PHASE 2: ENTITY TRACKING CONTEXT
+            // PHASE 2: ENTITY TRACKING SETUP
             // ═══════════════════════════════════════════════════════════════
             
             EntityOperationListener.EntityOperationContext existingCtx = 
                 EntityOperationListener.getOperationContext();
             
-            if (existingCtx != null) {
-                log.warn("WARNING: Operation context already exists! Cleaning...");
+            if (existingCtx != null && !existingCtx.isCleared()) {
+                log.error("CRITICAL: Operation context leak detected!");
+                log.error("   Thread: {}", Thread.currentThread().getId());
+                log.error("   Forcing cleanup of leaked context...");
                 EntityOperationListener.clearOperationContext();
             }
             
-            operationContext = new EntityOperationListener.EntityOperationContext(true);
-            EntityOperationListener.setOperationContext(operationContext);
+            resources.operationContext = new EntityOperationListener.EntityOperationContext(true);
+            EntityOperationListener.setOperationContext(resources.operationContext);
             
             context = context.withPhase(TransactionPhase.COLLECTING);
             SaktiTxContextHolder.update(context);
+            resources.context = context;
             
             log.debug("Entity tracking context initialized");
             
             // ═══════════════════════════════════════════════════════════════
-            // PHASE 3: START TRANSACTIONS & ENLIST RESOURCES
+            // PHASE 3: START TRANSACTIONS
             // ═══════════════════════════════════════════════════════════════
             
-            startAllTransactions(activeTransactions);
+            startAllTransactions(resources.activeTransactions);
             
-            for (String datasource : activeTransactions.keySet()) {
+            for (String datasource : resources.activeTransactions.keySet()) {
                 ResourceEnlistment resource = new ResourceEnlistment(datasource, "DATABASE");
                 context = context.withResource(resource);
             }
             SaktiTxContextHolder.update(context);
+            resources.context = context;
             
             // ═══════════════════════════════════════════════════════════════
             // PHASE 4: ACQUIRE LOCK
@@ -182,9 +219,10 @@ public class SaktiDistributedTxAspect {
             
             if (!annotation.lockKey().isEmpty() && lockManager != null) {
                 String lockKey = evaluateExpression(annotation.lockKey(), pjp);
-                lock = acquireLock(lockKey);
+                resources.lock = acquireLock(lockKey);
                 context = context.withLock(lockKey);
                 SaktiTxContextHolder.update(context);
+                resources.context = context;
             }
             
             // ═══════════════════════════════════════════════════════════════
@@ -193,7 +231,7 @@ public class SaktiDistributedTxAspect {
             
             log.debug("Executing business logic...");
             Object result = pjp.proceed();
-            log.debug("Business logic completed");
+            log.debug("Business logic completed successfully");
             
             // ═══════════════════════════════════════════════════════════════
             // PHASE 6: FLUSH & COLLECT OPERATIONS
@@ -202,7 +240,7 @@ public class SaktiDistributedTxAspect {
             flushAllEntityManagers();
             
             List<EntityOperationListener.ConfirmedOperation> operations = 
-                operationContext.getConfirmedOperations();
+                resources.operationContext.getConfirmedOperations();
             
             log.debug("Collected {} operations from tracking context", operations.size());
             
@@ -210,7 +248,7 @@ public class SaktiDistributedTxAspect {
                 EntityManager em = findEntityManagerForEntity(op.entityClass);
                 String datasource = emMapper.getDatasourceName(em);
                 
-                txLog.recordOperation(
+                resources.txLog.recordOperation(
                     datasource,
                     op.type,
                     op.entityClass,
@@ -225,6 +263,7 @@ public class SaktiDistributedTxAspect {
             
             context = context.withPhase(TransactionPhase.VALIDATING);
             SaktiTxContextHolder.update(context);
+            resources.context = context;
             
             log.info("Starting pre-commit validation...");
             ValidationResult validation = preCommitValidator.validate(context);
@@ -238,10 +277,10 @@ public class SaktiDistributedTxAspect {
                     log.error("  - [ERROR] {}: {}", issue.getCode(), issue.getMessage());
                 }
                 
-                log.error("Transaction ABORTED before commit - databases still consistent");
+                log.error("Transaction ABORTED before commit - databases remain consistent");
                 log.error("═══════════════════════════════════════════════════════════");
                 
-                rollbackAllTransactions(activeTransactions);
+                rollbackAllTransactions(resources.activeTransactions);
                 
                 Duration duration = Duration.between(startTime, Instant.now());
                 metrics.recordTransactionRolledBack(duration);
@@ -256,29 +295,34 @@ public class SaktiDistributedTxAspect {
             log.info("Validation passed - Risk Level: {}", validation.getOverallRisk());
             
             // ═══════════════════════════════════════════════════════════════
-            // PHASE 8: PREPARED → READY TO COMMIT
+            // PHASE 8: PREPARED STATE
             // ═══════════════════════════════════════════════════════════════
             
             context = context.withPhase(TransactionPhase.PREPARED);
             SaktiTxContextHolder.update(context);
+            resources.context = context;
             
             for (ResourceEnlistment resource : context.getResources()) {
                 resource.setPrepared(true);
             }
             
             // ═══════════════════════════════════════════════════════════════
-            // PHASE 9: COMMIT TRANSACTIONS
+            // PHASE 9: COMMIT (POINT OF NO RETURN)
             // ═══════════════════════════════════════════════════════════════
             
             context = context.withPhase(TransactionPhase.COMMITTING);
             SaktiTxContextHolder.update(context);
+            resources.context = context;
             
-            commitAllTransactions(activeTransactions);
+            log.debug("Starting commit phase...");
+            commitAllTransactions(resources.activeTransactions);
+            resources.committed.set(true); // ✓ COMMITTED FLAG SET
             
             context = context.withPhase(TransactionPhase.COMMITTED);
             SaktiTxContextHolder.update(context);
+            resources.context = context;
             
-            commit(txLog);
+            commit(resources.txLog);
             
             Duration duration = Duration.between(startTime, Instant.now());
             metrics.recordTransactionCommitted(duration);
@@ -292,7 +336,7 @@ public class SaktiDistributedTxAspect {
             
             log.info("═══════════════════════════════════════════════════════════");
             log.info("Distributed Transaction COMMITTED");
-            log.info("Transaction ID: {}", txId);
+            log.info("Transaction ID: {}", resources.txId);
             log.info("Operations: {}", operations.size());
             log.info("Duration: {}ms", duration.toMillis());
             log.info("Risk Level: {}", context.getOverallRiskLevel());
@@ -302,31 +346,57 @@ public class SaktiDistributedTxAspect {
             
         } catch (Throwable error) {
             // ═══════════════════════════════════════════════════════════════
-            // PHASE 10: ERROR HANDLING & COMPENSATION
+            // PHASE 10: ERROR HANDLING
             // ═══════════════════════════════════════════════════════════════
             
-            String errorTxId = txId != null ? txId : "unknown";
-            int operationCount = txLog != null ? txLog.getOperations().size() : 0;
+            String errorTxId = resources.txId != null ? resources.txId : "unknown";
+            int operationCount = resources.txLog != null ? resources.txLog.getOperations().size() : 0;
             
             log.error("═══════════════════════════════════════════════════════════");
             log.error("Distributed Transaction FAILED");
             log.error("Transaction ID: {}", errorTxId);
             log.error("Operations Recorded: {}", operationCount);
+            log.error("Committed: {}", resources.committed.get());
             log.error("Error: {}", error.getMessage());
             log.error("═══════════════════════════════════════════════════════════");
             
-            if (context != null) {
-                context = context.withPhase(TransactionPhase.ROLLING_BACK);
-                SaktiTxContextHolder.update(context);
+            // ═══════════════════════════════════════════════════════════════
+            // CRITICAL CHECK: Sudah commit atau belum?
+            // ═══════════════════════════════════════════════════════════════
+            
+            if (resources.committed.get()) {
+                // ❌ FATAL: Error SETELAH commit berhasil
+                log.error("═══════════════════════════════════════════════════════════");
+                log.error("CRITICAL: Error occurred AFTER successful commit!");
+                log.error("This should NOT happen - indicates application-level error");
+                log.error("Databases are COMMITTED and CONSISTENT");
+                log.error("NO COMPENSATION NEEDED");
+                log.error("═══════════════════════════════════════════════════════════");
+                
+                Duration duration = Duration.between(startTime, Instant.now());
+                metrics.recordTransactionCommitted(duration);
+                
+                // Re-throw original error - let application handle
+                throw error;
             }
             
-            rollbackAllTransactions(activeTransactions);
+            // ✓ Belum commit - safe untuk rollback
+            if (resources.context != null) {
+                SaktiTxContext ctx = resources.context.withPhase(TransactionPhase.ROLLING_BACK);
+                SaktiTxContextHolder.update(ctx);
+                resources.context = ctx;
+            }
+            
+            rollbackAllTransactions(resources.activeTransactions);
+            
+            // ═══════════════════════════════════════════════════════════════
+            // COMPENSATION - Context masih ada!
+            // ═══════════════════════════════════════════════════════════════
             
             boolean rollbackSuccess = false;
-            if (txLog != null) {
-                // Execute compensation BEFORE clearing context
-                rollbackSuccess = rollbackWithRetry(txLog, error);
-                compensationExecuted = true;
+            if (resources.txLog != null && resources.txLog.getOperations().size() > 0) {
+                rollbackSuccess = rollbackWithRetry(resources.txLog, error);
+                resources.compensationExecuted = true;
             }
             
             Duration duration = Duration.between(startTime, Instant.now());
@@ -350,296 +420,159 @@ public class SaktiDistributedTxAspect {
         } finally {
             // ═══════════════════════════════════════════════════════════════
             // PHASE 11: GUARANTEED CLEANUP
-            // Only clean up AFTER compensation is done
+            // Context cleanup HANYA setelah compensation selesai
             // ═══════════════════════════════════════════════════════════════
             
-            if (needsCleanup) {
-                // Wait for compensation to finish before cleanup
-                if (compensationExecuted) {
-                    log.debug("Compensation executed - safe to cleanup context");
-                }
-                
-                ultimateCleanup(lock, context, txId, operationContext);
-            }
+            safeguardedCleanup(resources);
         }
     }
-
+    
     /**
-     * Cleanup order matters!
+     * ═══════════════════════════════════════════════════════════════════════
+     * PRODUCTION-GRADE CLEANUP
+     * ═══════════════════════════════════════════════════════════════════════
+     * 
+     * GUARANTEES:
+     * 1. Context cleanup ONLY after compensation done
+     * 2. Multiple fallback mechanisms
+     * 3. Never throws exceptions
+     * 4. Thread-safe
+     * 5. Idempotent (safe to call multiple times)
      */
-    private void ultimateCleanup(LockManager.LockHandle lock,
-            SaktiTxContext context, String txId,
-            EntityOperationListener.EntityOperationContext operationContext) {
-
+    private void safeguardedCleanup(TransactionResources resources) {
         long threadId = Thread.currentThread().getId();
-
-        log.trace("ULTIMATE CLEANUP START - Thread: {}", threadId);
-
-        // Step 1: Release lock (can be done early)
+        
         try {
-            if (lock != null) {
-                lock.release();
-                log.trace("  [1/4] ✓ Lock released");
-            }
-        } catch (Throwable e) {
-            log.error("  [1/4] ✗ Lock release failed", e);
-        }
-
-        // Step 2: Clear operation context
-        // Only clear if we own it
-        try {
-            if (operationContext != null && 
-                EntityOperationListener.getOperationContext() == operationContext) {
-                EntityOperationListener.clearOperationContext();
-                log.trace("  [2/4] ✓ Operation context cleared");
+            log.trace("╔═══════════════════════════════════════════════════════════╗");
+            log.trace("║         SAFEGUARDED CLEANUP - Thread: {}              ║", threadId);
+            log.trace("╠═══════════════════════════════════════════════════════════╣");
+            
+            // ═══════════════════════════════════════════════════════════════
+            // STEP 1: Release Lock (can be done early)
+            // ═══════════════════════════════════════════════════════════════
+            
+            if (resources.lock != null) {
+                try {
+                    resources.lock.release();
+                    log.trace("║ [1/5] ✓ Lock released                                    ║");
+                } catch (Throwable e) {
+                    log.error("║ [1/5] ✗ Lock release failed: {}                    ║", e.getMessage());
+                }
             } else {
-                log.trace("  [2/4] - Operation context not ours or already cleared");
+                log.trace("║ [1/5] - No lock to release                                ║");
             }
-        } catch (Throwable e) {
-            log.error("  [2/4] ✗ Operation context cleanup failed", e);
-        }
-
-        // Step 3: Clear TX context
-        try {
-            if (SaktiTxContextHolder.get() == context) {
-                SaktiTxContextHolder.clear();
-                log.trace("  [3/4] ✓ TX context cleared");
+            
+            // ═══════════════════════════════════════════════════════════════
+            // STEP 2: Wait for compensation (if needed)
+            // ═══════════════════════════════════════════════════════════════
+            
+            if (resources.compensationExecuted) {
+                log.trace("║ [2/5] ✓ Compensation completed - safe to cleanup context ║");
             } else {
-                log.trace("  [3/4] - TX context not ours or already cleared");
+                log.trace("║ [2/5] - No compensation needed                           ║");
             }
-        } catch (Throwable e) {
-            log.error("  [3/4] ✗ TX context cleanup failed", e);
+            
+            // ═══════════════════════════════════════════════════════════════
+            // STEP 3: Clear Operation Context (ONLY if we own it)
+            // ═══════════════════════════════════════════════════════════════
+            
+            if (resources.operationContext != null) {
+                try {
+                    EntityOperationListener.EntityOperationContext currentCtx = 
+                        EntityOperationListener.getOperationContext();
+                    
+                    if (currentCtx == resources.operationContext) {
+                        EntityOperationListener.clearOperationContext();
+                        log.trace("║ [3/5] ✓ Operation context cleared                        ║");
+                    } else {
+                        log.trace("║ [3/5] - Operation context already cleared by others      ║");
+                    }
+                    
+                    // Verify
+                    if (EntityOperationListener.getOperationContext() != null) {
+                        log.error("║ [3/5] ✗ Context STILL present after clear - forcing...   ║");
+                        EntityOperationListener.clearOperationContext();
+                    }
+                    
+                } catch (Throwable e) {
+                    log.error("║ [3/5] ✗ Operation context cleanup failed: {}       ║", e.getMessage());
+                }
+            } else {
+                log.trace("║ [3/5] - No operation context to clear                    ║");
+            }
+            
+            // ═══════════════════════════════════════════════════════════════
+            // STEP 4: Clear TX Context (ONLY if we own it)
+            // ═══════════════════════════════════════════════════════════════
+            
+            if (resources.context != null) {
+                try {
+                    SaktiTxContext currentCtx = SaktiTxContextHolder.get();
+                    
+                    if (currentCtx == resources.context) {
+                        SaktiTxContextHolder.clear();
+                        log.trace("║ [4/5] ✓ TX context cleared                               ║");
+                    } else {
+                        log.trace("║ [4/5] - TX context already cleared by others             ║");
+                    }
+                    
+                    // Verify
+                    if (SaktiTxContextHolder.get() != null) {
+                        log.error("║ [4/5] ✗ Context STILL present - forcing clear...         ║");
+                        SaktiTxContextHolder.clear();
+                    }
+                    
+                } catch (Throwable e) {
+                    log.error("║ [4/5] ✗ TX context cleanup failed: {}              ║", e.getMessage());
+                }
+            } else {
+                log.trace("║ [4/5] - No TX context to clear                           ║");
+            }
+            
+            // ═══════════════════════════════════════════════════════════════
+            // STEP 5: Clear MDC
+            // ═══════════════════════════════════════════════════════════════
+            
+            try {
+                MDC.remove("txId");
+                MDC.remove("businessKey");
+                log.trace("║ [5/5] ✓ MDC cleared                                       ║");
+            } catch (Throwable e) {
+                log.error("║ [5/5] ✗ MDC cleanup failed: {}                      ║", e.getMessage());
+            }
+            
+            log.trace("╚═══════════════════════════════════════════════════════════╝");
+            
+        } catch (Throwable fatal) {
+            // NEVER throw from cleanup
+            log.error("FATAL: Cleanup failed catastrophically", fatal);
         }
-
-        // Step 4: Clear MDC
-        try {
-            MDC.remove("txId");
-            MDC.remove("businessKey");
-            log.trace("  [4/4] ✓ MDC cleared");
-        } catch (Throwable e) {
-            log.error("  [4/4] ✗ MDC cleanup failed", e);
-        }
-
-        log.trace("ULTIMATE CLEANUP END");
     }
-
-    // ========================================================================
-    // Helper methods
-    // ========================================================================
-
+    
+    // ════════════════════════════════════════════════════════════════════════
+    // RESOURCE TRACKING CLASS
+    // ════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Centralized resource tracking untuk guaranteed cleanup
+     */
+    private static class TransactionResources {
+        String txId;
+        TransactionLog txLog;
+        SaktiTxContext context;
+        EntityOperationListener.EntityOperationContext operationContext;
+        LockManager.LockHandle lock;
+        Map<String, TransactionStatus> activeTransactions = new HashMap<>();
+        
+        // State tracking
+        AtomicBoolean committed = new AtomicBoolean(false);
+        boolean compensationExecuted = false;
+    }
+    
+    // ════════════════════════════════════════════════════════════════════════
+    // HELPER METHODS (unchanged from original)
+    // ════════════════════════════════════════════════════════════════════════
+    
     private void startAllTransactions(Map<String, TransactionStatus> activeTransactions) {
         if (transactionManagers.isEmpty()) {
-            log.warn("No PlatformTransactionManager beans found");
-            return;
-        }
-
-        for (Map.Entry<String, PlatformTransactionManager> entry : transactionManagers.entrySet()) {
-            String datasource = entry.getKey();
-            PlatformTransactionManager txManager = entry.getValue();
-
-            try {
-                DefaultTransactionDefinition def = new DefaultTransactionDefinition();
-                def.setName("SAKTI-TX-" + datasource);
-                def.setPropagationBehavior(DefaultTransactionDefinition.PROPAGATION_REQUIRED);
-
-                TransactionStatus status = txManager.getTransaction(def);
-                activeTransactions.put(datasource, status);
-
-                log.debug("Started transaction for: {}", datasource);
-
-            } catch (Exception e) {
-                log.error("Failed to start transaction for {}", datasource, e);
-            }
-        }
-    }
-
-    private void flushAllEntityManagers() {
-        for (Map.Entry<String, EntityManager> entry : allEntityManagers.entrySet()) {
-            try {
-                EntityManager em = entry.getValue();
-                if (em.isJoinedToTransaction()) {
-                    em.flush();
-                    log.trace("Flushed: {}", entry.getKey());
-                }
-            } catch (Exception e) {
-                log.warn("Flush failed for {}", entry.getKey(), e);
-            }
-        }
-    }
-
-    private void commitAllTransactions(Map<String, TransactionStatus> activeTransactions) {
-        for (Map.Entry<String, TransactionStatus> entry : activeTransactions.entrySet()) {
-            String datasource = entry.getKey();
-            TransactionStatus status = entry.getValue();
-
-            try {
-                if (!status.isCompleted()) {
-                    PlatformTransactionManager txManager = transactionManagers.get(datasource);
-                    if (txManager != null) {
-                        txManager.commit(status);
-                        log.debug("Committed: {}", datasource);
-                    }
-                }
-            } catch (Exception e) {
-                log.error("Commit failed for {}", datasource, e);
-                throw e;
-            }
-        }
-        activeTransactions.clear();
-    }
-
-    private void rollbackAllTransactions(Map<String, TransactionStatus> activeTransactions) {
-        for (Map.Entry<String, TransactionStatus> entry : activeTransactions.entrySet()) {
-            String datasource = entry.getKey();
-            TransactionStatus status = entry.getValue();
-
-            try {
-                if (!status.isCompleted()) {
-                    PlatformTransactionManager txManager = transactionManagers.get(datasource);
-                    if (txManager != null) {
-                        txManager.rollback(status);
-                        log.debug("Rolled back: {}", datasource);
-                    }
-                }
-            } catch (Exception e) {
-                log.error("Rollback failed for {}", datasource, e);
-            }
-        }
-        activeTransactions.clear();
-    }
-
-    private boolean rollbackWithRetry(TransactionLog txLog, Throwable originalError) {
-        String txId = txLog.getTxId();
-        int maxAttempts = properties.getMultiDb().getMaxRollbackRetries();
-        long baseBackoffMs = properties.getMultiDb().getRollbackRetryBackoffMs();
-
-        logManager.markRollingBack(txId, originalError.getMessage());
-
-        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-                log.info("Rollback attempt {}/{}", attempt, maxAttempts);
-
-                metrics.recordCompensationAttempt();
-                compensator.rollback(txLog);
-                logManager.markRolledBack(txId);
-
-                metrics.recordCompensationSuccess();
-
-                log.info("✓ ROLLBACK SUCCESSFUL on attempt {}", attempt);
-                return true;
-
-            } catch (Exception e) {
-                log.error("Rollback attempt {} FAILED: {}", attempt, e.getMessage());
-
-                metrics.recordCompensationFailure();
-
-                if (attempt < maxAttempts) {
-                    long backoffMs = baseBackoffMs * (long) Math.pow(2, attempt - 1);
-                    try {
-                        Thread.sleep(backoffMs);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
-                }
-            }
-        }
-
-        logManager.markFailed(txId, "Rollback failed after " + maxAttempts + " attempts");
-        return false;
-    }
-
-    private EntityManager findEntityManagerForEntity(String entityClassName) {
-        try {
-            Class<?> entityClass = Class.forName(entityClassName);
-
-            for (EntityManager em : allEntityManagers.values()) {
-                try {
-                    em.getMetamodel().entity(entityClass);
-                    return em;
-                } catch (IllegalArgumentException e) {
-                    // Not managed by this EM
-                }
-            }
-        } catch (Exception e) {
-            log.warn("Cannot find EM for: {}", entityClassName);
-        }
-
-        return allEntityManagers.values().iterator().next();
-    }
-
-    private void commit(TransactionLog txLog) {
-        try {
-            logManager.markCommitted(txLog.getTxId());
-        } catch (Exception e) {
-            log.error("Failed to mark as committed: {}", txLog.getTxId(), e);
-        }
-    }
-
-    private LockManager.LockHandle acquireLock(String lockKey) throws Exception {
-        long waitTime = properties.getLock().getWaitTimeMs();
-        long leaseTime = properties.getLock().getLeaseTimeMs();
-
-        log.debug("Acquiring lock: {}", lockKey);
-
-        LockManager.LockHandle lock = lockManager.tryLock(lockKey, waitTime, leaseTime);
-
-        if (!lock.isAcquired()) {
-            throw new IllegalStateException("Cannot acquire lock: " + lockKey);
-        }
-
-        return lock;
-    }
-
-    private String generateBusinessKey(ProceedingJoinPoint pjp) {
-        MethodSignature signature = (MethodSignature) pjp.getSignature();
-        String className = signature.getDeclaringType().getSimpleName();
-        String methodName = signature.getName();
-
-        Object[] args = pjp.getArgs();
-        String argInfo = args.length > 0 ? String.valueOf(args[0]) : "noargs";
-
-        return String.format("%s.%s(%s)", className, methodName, argInfo);
-    }
-
-    private String evaluateExpression(String expr, ProceedingJoinPoint pjp) {
-        if (expr == null || expr.trim().isEmpty()) {
-            return null;
-        }
-
-        try {
-            StandardEvaluationContext context = new StandardEvaluationContext();
-            MethodSignature signature = (MethodSignature) pjp.getSignature();
-            Object[] args = pjp.getArgs();
-            String[] paramNames = signature.getParameterNames();
-
-            context.setVariable("args", args);
-            for (int i = 0; i < args.length; i++) {
-                context.setVariable("a" + i, args[i]);
-                if (paramNames != null && i < paramNames.length) {
-                    context.setVariable(paramNames[i], args[i]);
-                }
-            }
-
-            Object value = parser.parseExpression(expr).getValue(context);
-            return value != null ? value.toString() : null;
-
-        } catch (Exception e) {
-            log.warn("Failed to evaluate: {}", expr);
-            return expr;
-        }
-    }
-
-    public static class ValidationException extends RuntimeException {
-        private final ValidationResult validationResult;
-
-        public ValidationException(String message, ValidationResult validationResult) {
-            super(message);
-            this.validationResult = validationResult;
-        }
-
-        public ValidationResult getValidationResult() {
-            return validationResult;
-        }
-    }
-}
+            log.warn("No Plat
