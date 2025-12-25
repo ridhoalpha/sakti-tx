@@ -94,6 +94,10 @@ public class SaktiDistributedTxAspect {
         Instant startTime = Instant.now();
         metrics.recordTransactionStart();
         
+        // ═══════════════════════════════════════════════════════════════
+        // RESOURCE DECLARATION (for cleanup tracking)
+        // ═══════════════════════════════════════════════════════════════
+        
         TransactionLog txLog = null;
         EntityOperationListener.EntityOperationContext operationContext = null;
         LockManager.LockHandle lock = null;
@@ -101,9 +105,13 @@ public class SaktiDistributedTxAspect {
         String txId = null;
         SaktiTxContext context = null;
         
+        // Track if we need to do cleanup
+        boolean needsCleanup = false;
+        boolean compensationExecuted = false;
+        
         try {
             // ═══════════════════════════════════════════════════════════════
-            // PHASE 1: SETUP - Create SaktiTxContext
+            // PHASE 1: SETUP
             // ═══════════════════════════════════════════════════════════════
             
             MethodSignature signature = (MethodSignature) pjp.getSignature();
@@ -112,25 +120,23 @@ public class SaktiDistributedTxAspect {
             
             String businessKey = generateBusinessKey(pjp);
             
-            // Create SaktiTxContext (new context model)
             context = new SaktiTxContext.Builder()
                 .businessKey(businessKey)
                 .phase(TransactionPhase.CREATED)
                 .build();
             
             txId = context.getTxId();
-            
-            // Bind to thread
             SaktiTxContextHolder.set(context);
             
-            // Create transaction log (for persistence)
             txLog = logManager.createLog(businessKey);
             
             MDC.put("txId", txId);
             MDC.put("businessKey", businessKey);
             
+            needsCleanup = true; // Mark that we need cleanup
+            
             log.info("═══════════════════════════════════════════════════════════");
-            log.info("Distributed Transaction STARTED (v2.0)");
+            log.info("Distributed Transaction STARTED (v3.0)");
             log.info("Transaction ID: {}", txId);
             log.info("Business Key: {}", businessKey);
             log.info("Method: {}.{}", 
@@ -153,7 +159,6 @@ public class SaktiDistributedTxAspect {
             operationContext = new EntityOperationListener.EntityOperationContext(true);
             EntityOperationListener.setOperationContext(operationContext);
             
-            // Update phase
             context = context.withPhase(TransactionPhase.COLLECTING);
             SaktiTxContextHolder.update(context);
             
@@ -165,7 +170,6 @@ public class SaktiDistributedTxAspect {
             
             startAllTransactions(activeTransactions);
             
-            // Enlist resources in context
             for (String datasource : activeTransactions.keySet()) {
                 ResourceEnlistment resource = new ResourceEnlistment(datasource, "DATABASE");
                 context = context.withResource(resource);
@@ -179,8 +183,6 @@ public class SaktiDistributedTxAspect {
             if (!annotation.lockKey().isEmpty() && lockManager != null) {
                 String lockKey = evaluateExpression(annotation.lockKey(), pjp);
                 lock = acquireLock(lockKey);
-                
-                // Record lock in context
                 context = context.withLock(lockKey);
                 SaktiTxContextHolder.update(context);
             }
@@ -204,7 +206,6 @@ public class SaktiDistributedTxAspect {
             
             log.debug("Collected {} operations from tracking context", operations.size());
             
-            // Save to transaction log
             for (EntityOperationListener.ConfirmedOperation op : operations) {
                 EntityManager em = findEntityManagerForEntity(op.entityClass);
                 String datasource = emMapper.getDatasourceName(em);
@@ -219,7 +220,7 @@ public class SaktiDistributedTxAspect {
             }
             
             // ═══════════════════════════════════════════════════════════════
-            // PHASE 7: PRE-COMMIT VALIDATION (NEW!)
+            // PHASE 7: PRE-COMMIT VALIDATION
             // ═══════════════════════════════════════════════════════════════
             
             context = context.withPhase(TransactionPhase.VALIDATING);
@@ -240,7 +241,6 @@ public class SaktiDistributedTxAspect {
                 log.error("Transaction ABORTED before commit - databases still consistent");
                 log.error("═══════════════════════════════════════════════════════════");
                 
-                // Rollback Spring transactions (no compensation needed)
                 rollbackAllTransactions(activeTransactions);
                 
                 Duration duration = Duration.between(startTime, Instant.now());
@@ -249,12 +249,10 @@ public class SaktiDistributedTxAspect {
                 throw new ValidationException("Pre-commit validation failed", validation);
             }
             
-            // Log warnings
             for (ValidationIssue issue : validation.getWarnings()) {
                 log.warn("  - [WARNING] {}: {}", issue.getCode(), issue.getMessage());
             }
             
-            // Log risk level
             log.info("Validation passed - Risk Level: {}", validation.getOverallRisk());
             
             // ═══════════════════════════════════════════════════════════════
@@ -264,7 +262,6 @@ public class SaktiDistributedTxAspect {
             context = context.withPhase(TransactionPhase.PREPARED);
             SaktiTxContextHolder.update(context);
             
-            // Mark resources as prepared
             for (ResourceEnlistment resource : context.getResources()) {
                 resource.setPrepared(true);
             }
@@ -286,7 +283,6 @@ public class SaktiDistributedTxAspect {
             Duration duration = Duration.between(startTime, Instant.now());
             metrics.recordTransactionCommitted(duration);
             
-            // Record risk metrics
             for (Map.Entry<id.go.kemenkeu.djpbn.sakti.tx.core.risk.RiskFlag, Integer> entry : 
                     context.getRiskMetrics().entrySet()) {
                 for (int i = 0; i < entry.getValue(); i++) {
@@ -306,7 +302,7 @@ public class SaktiDistributedTxAspect {
             
         } catch (Throwable error) {
             // ═══════════════════════════════════════════════════════════════
-            // PHASE 10: ERROR HANDLING
+            // PHASE 10: ERROR HANDLING & COMPENSATION
             // ═══════════════════════════════════════════════════════════════
             
             String errorTxId = txId != null ? txId : "unknown";
@@ -319,7 +315,6 @@ public class SaktiDistributedTxAspect {
             log.error("Error: {}", error.getMessage());
             log.error("═══════════════════════════════════════════════════════════");
             
-            // Update phase
             if (context != null) {
                 context = context.withPhase(TransactionPhase.ROLLING_BACK);
                 SaktiTxContextHolder.update(context);
@@ -329,7 +324,9 @@ public class SaktiDistributedTxAspect {
             
             boolean rollbackSuccess = false;
             if (txLog != null) {
+                // Execute compensation BEFORE clearing context
                 rollbackSuccess = rollbackWithRetry(txLog, error);
+                compensationExecuted = true;
             }
             
             Duration duration = Duration.between(startTime, Instant.now());
@@ -353,20 +350,32 @@ public class SaktiDistributedTxAspect {
         } finally {
             // ═══════════════════════════════════════════════════════════════
             // PHASE 11: GUARANTEED CLEANUP
+            // Only clean up AFTER compensation is done
             // ═══════════════════════════════════════════════════════════════
             
-            ultimateCleanup(lock, context, txId);
+            if (needsCleanup) {
+                // Wait for compensation to finish before cleanup
+                if (compensationExecuted) {
+                    log.debug("Compensation executed - safe to cleanup context");
+                }
+                
+                ultimateCleanup(lock, context, txId, operationContext);
+            }
         }
     }
 
+    /**
+     * Cleanup order matters!
+     */
     private void ultimateCleanup(LockManager.LockHandle lock,
-            SaktiTxContext context, String txId) {
+            SaktiTxContext context, String txId,
+            EntityOperationListener.EntityOperationContext operationContext) {
 
         long threadId = Thread.currentThread().getId();
 
         log.trace("ULTIMATE CLEANUP START - Thread: {}", threadId);
 
-        // Step 1: Release lock
+        // Step 1: Release lock (can be done early)
         try {
             if (lock != null) {
                 lock.release();
@@ -375,18 +384,29 @@ public class SaktiDistributedTxAspect {
         } catch (Throwable e) {
             log.error("  [1/4] ✗ Lock release failed", e);
         }
+
         // Step 2: Clear operation context
+        // Only clear if we own it
         try {
-            EntityOperationListener.clearOperationContext();
-            log.trace("  [2/4] ✓ Operation context cleared");
+            if (operationContext != null && 
+                EntityOperationListener.getOperationContext() == operationContext) {
+                EntityOperationListener.clearOperationContext();
+                log.trace("  [2/4] ✓ Operation context cleared");
+            } else {
+                log.trace("  [2/4] - Operation context not ours or already cleared");
+            }
         } catch (Throwable e) {
             log.error("  [2/4] ✗ Operation context cleanup failed", e);
         }
 
         // Step 3: Clear TX context
         try {
-            SaktiTxContextHolder.clear();
-            log.trace("  [3/4] ✓ TX context cleared");
+            if (SaktiTxContextHolder.get() == context) {
+                SaktiTxContextHolder.clear();
+                log.trace("  [3/4] ✓ TX context cleared");
+            } else {
+                log.trace("  [3/4] - TX context not ours or already cleared");
+            }
         } catch (Throwable e) {
             log.error("  [3/4] ✗ TX context cleanup failed", e);
         }
@@ -404,11 +424,10 @@ public class SaktiDistributedTxAspect {
     }
 
     // ========================================================================
-    // Helper methods (mostly unchanged from original)
+    // Helper methods
     // ========================================================================
 
     private void startAllTransactions(Map<String, TransactionStatus> activeTransactions) {
-        // Original implementation...
         if (transactionManagers.isEmpty()) {
             log.warn("No PlatformTransactionManager beans found");
             return;
