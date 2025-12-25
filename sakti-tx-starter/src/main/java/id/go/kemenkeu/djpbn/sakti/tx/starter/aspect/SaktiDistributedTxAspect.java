@@ -575,4 +575,217 @@ public class SaktiDistributedTxAspect {
     
     private void startAllTransactions(Map<String, TransactionStatus> activeTransactions) {
         if (transactionManagers.isEmpty()) {
-            log.warn("No Plat
+            log.warn("No PlatformTransactionManager beans found");
+            return;
+        }
+
+        for (Map.Entry<String, PlatformTransactionManager> entry : transactionManagers.entrySet()) {
+            String datasource = entry.getKey();
+            PlatformTransactionManager txManager = entry.getValue();
+
+            try {
+                DefaultTransactionDefinition def = new DefaultTransactionDefinition();
+                def.setName("SAKTI-TX-" + datasource);
+                def.setPropagationBehavior(DefaultTransactionDefinition.PROPAGATION_REQUIRED);
+
+                TransactionStatus status = txManager.getTransaction(def);
+                activeTransactions.put(datasource, status);
+
+                log.debug("Started transaction for: {}", datasource);
+
+            } catch (Exception e) {
+                log.error("Failed to start transaction for {}", datasource, e);
+            }
+        }
+    }
+
+    private void flushAllEntityManagers() {
+        for (Map.Entry<String, EntityManager> entry : allEntityManagers.entrySet()) {
+            try {
+                EntityManager em = entry.getValue();
+                if (em.isJoinedToTransaction()) {
+                    em.flush();
+                    log.trace("Flushed: {}", entry.getKey());
+                }
+            } catch (Exception e) {
+                log.warn("Flush failed for {}", entry.getKey(), e);
+            }
+        }
+    }
+
+    private void commitAllTransactions(Map<String, TransactionStatus> activeTransactions) {
+        for (Map.Entry<String, TransactionStatus> entry : activeTransactions.entrySet()) {
+            String datasource = entry.getKey();
+            TransactionStatus status = entry.getValue();
+
+            try {
+                if (!status.isCompleted()) {
+                    PlatformTransactionManager txManager = transactionManagers.get(datasource);
+                    if (txManager != null) {
+                        txManager.commit(status);
+                        log.debug("Committed: {}", datasource);
+                    }
+                }
+            } catch (Exception e) {
+                log.error("Commit failed for {}", datasource, e);
+                throw e;
+            }
+        }
+        activeTransactions.clear();
+    }
+
+    private void rollbackAllTransactions(Map<String, TransactionStatus> activeTransactions) {
+        for (Map.Entry<String, TransactionStatus> entry : activeTransactions.entrySet()) {
+            String datasource = entry.getKey();
+            TransactionStatus status = entry.getValue();
+
+            try {
+                if (!status.isCompleted()) {
+                    PlatformTransactionManager txManager = transactionManagers.get(datasource);
+                    if (txManager != null) {
+                        txManager.rollback(status);
+                        log.debug("Rolled back: {}", datasource);
+                    }
+                }
+            } catch (Exception e) {
+                log.error("Rollback failed for {}", datasource, e);
+            }
+        }
+        activeTransactions.clear();
+    }
+
+    private boolean rollbackWithRetry(TransactionLog txLog, Throwable originalError) {
+        String txId = txLog.getTxId();
+        int maxAttempts = properties.getMultiDb().getMaxRollbackRetries();
+        long baseBackoffMs = properties.getMultiDb().getRollbackRetryBackoffMs();
+
+        logManager.markRollingBack(txId, originalError.getMessage());
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                log.info("Rollback attempt {}/{}", attempt, maxAttempts);
+
+                metrics.recordCompensationAttempt();
+                compensator.rollback(txLog);
+                logManager.markRolledBack(txId);
+
+                metrics.recordCompensationSuccess();
+
+                log.info("✓ ROLLBACK SUCCESSFUL on attempt {}", attempt);
+                return true;
+
+            } catch (Exception e) {
+                log.error("Rollback attempt {} FAILED: {}", attempt, e.getMessage());
+
+                metrics.recordCompensationFailure();
+
+                if (attempt < maxAttempts) {
+                    long backoffMs = baseBackoffMs * (long) Math.pow(2, attempt - 1);
+                    try {
+                        Thread.sleep(backoffMs);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        }
+
+        logManager.markFailed(txId, "Rollback failed after " + maxAttempts + " attempts");
+        return false;
+    }
+
+    private EntityManager findEntityManagerForEntity(String entityClassName) {
+        try {
+            Class<?> entityClass = Class.forName(entityClassName);
+
+            for (EntityManager em : allEntityManagers.values()) {
+                try {
+                    em.getMetamodel().entity(entityClass);
+                    return em;
+                } catch (IllegalArgumentException e) {
+                    // Not managed by this EM
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Cannot find EM for: {}", entityClassName);
+        }
+
+        return allEntityManagers.values().iterator().next();
+    }
+
+    private void commit(TransactionLog txLog) {
+        try {
+            logManager.markCommitted(txLog.getTxId());
+        } catch (Exception e) {
+            log.error("Failed to mark as committed: {}", txLog.getTxId(), e);
+        }
+    }
+
+    private LockManager.LockHandle acquireLock(String lockKey) throws Exception {
+        long waitTime = properties.getLock().getWaitTimeMs();
+        long leaseTime = properties.getLock().getLeaseTimeMs();
+
+        log.debug("Acquiring lock: {}", lockKey);
+
+        LockManager.LockHandle lock = lockManager.tryLock(lockKey, waitTime, leaseTime);
+
+        if (!lock.isAcquired()) {
+            throw new IllegalStateException("Cannot acquire lock: " + lockKey);
+        }
+
+        return lock;
+    }
+
+    private String generateBusinessKey(ProceedingJoinPoint pjp) {
+        MethodSignature signature = (MethodSignature) pjp.getSignature();
+        String className = signature.getDeclaringType().getSimpleName();
+        String methodName = signature.getName();
+
+        Object[] args = pjp.getArgs();
+        String argInfo = args.length > 0 ? String.valueOf(args[0]) : "noargs";
+
+        return String.format("%s.%s(%s)", className, methodName, argInfo);
+    }
+
+    private String evaluateExpression(String expr, ProceedingJoinPoint pjp) {
+        if (expr == null || expr.trim().isEmpty()) {
+            return null;
+        }
+
+        try {
+            StandardEvaluationContext context = new StandardEvaluationContext();
+            MethodSignature signature = (MethodSignature) pjp.getSignature();
+            Object[] args = pjp.getArgs();
+            String[] paramNames = signature.getParameterNames();
+
+            context.setVariable("args", args);
+            for (int i = 0; i < args.length; i++) {
+                context.setVariable("a" + i, args[i]);
+                if (paramNames != null && i < paramNames.length) {
+                    context.setVariable(paramNames[i], args[i]);
+                }
+            }
+
+            Object value = parser.parseExpression(expr).getValue(context);
+            return value != null ? value.toString() : null;
+
+        } catch (Exception e) {
+            log.warn("Failed to evaluate: {}", expr);
+            return expr;
+        }
+    }
+
+    public static class ValidationException extends RuntimeException {
+        private final ValidationResult validationResult;
+
+        public ValidationException(String message, ValidationResult validationResult) {
+            super(message);
+            this.validationResult = validationResult;
+        }
+
+        public ValidationResult getValidationResult() {
+            return validationResult;
+        }
+    }
+}
