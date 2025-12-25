@@ -349,30 +349,64 @@ public class SaktiTxAutoConfiguration {
         
         EntityManagerDatasourceMapper mapper = new EntityManagerDatasourceMapper();
         
-        Map<String, EntityManagerFactory> emBeans = ctx.getBeansOfType(EntityManagerFactory.class);
-        for (Map.Entry<String, EntityManagerFactory> entry : emBeans.entrySet()) {
-            String datasourceName = extractDatasourceName(entry.getKey());
-            mapper.registerEntityManagerFactory(datasourceName, entry.getValue());
-            log.info("  → Registered: {} -> {}", datasourceName, entry.getKey());
-        }
-        
+        // ═══════════════════════════════════════════════════════════════
+        // PRIORITAS 1: Register dari LocalContainerEntityManagerFactoryBean
+        // (Ini yang benar karena dapat EntityManagerFactory langsung)
+        // ═══════════════════════════════════════════════════════════════
         Map<String, LocalContainerEntityManagerFactoryBean> emfBeans = 
             ctx.getBeansOfType(LocalContainerEntityManagerFactoryBean.class);
         
         for (Map.Entry<String, LocalContainerEntityManagerFactoryBean> entry : emfBeans.entrySet()) {
             try {
                 String beanName = entry.getKey();
-                EntityManagerFactory em = entry.getValue().getObject();
+                EntityManagerFactory emf = entry.getValue().getObject();
+                
+                if (emf == null) {
+                    log.warn("EntityManagerFactory is NULL for bean: {}", beanName);
+                    continue;
+                }
+                
+                // Extract datasource name dari bean name
                 String datasourceName = extractDatasourceName(beanName);
                 
-                if (mapper.getAllEntityManagerFactories().get(datasourceName) == null) {
-                    mapper.registerEntityManagerFactory(datasourceName, em);
-                    log.info("  → Registered from factory: {}", datasourceName);
+                mapper.registerEntityManagerFactory(datasourceName, emf);
+                log.info("  → Registered: {} -> {}", datasourceName, beanName);
+                
+                // IMPORTANT: Juga register dengan nama asli bean
+                if (!beanName.equals(datasourceName)) {
+                    mapper.registerEntityManagerFactory(beanName, emf);
+                    log.debug("  → Also registered with original name: {}", beanName);
                 }
+                
             } catch (Exception e) {
-                log.warn("Could not create EM from factory: {}", entry.getKey());
+                log.warn("Could not register EntityManagerFactory from bean: {} - {}", 
+                    entry.getKey(), e.getMessage());
             }
         }
+        
+        // ═══════════════════════════════════════════════════════════════
+        // PRIORITAS 2: Register dari EntityManagerFactory beans (fallback)
+        // ═══════════════════════════════════════════════════════════════
+        Map<String, EntityManagerFactory> emBeans = ctx.getBeansOfType(EntityManagerFactory.class);
+        for (Map.Entry<String, EntityManagerFactory> entry : emBeans.entrySet()) {
+            String beanName = entry.getKey();
+            EntityManagerFactory emf = entry.getValue();
+            
+            // Skip jika sudah terdaftar
+            String datasourceName = extractDatasourceName(beanName);
+            if (mapper.getAllEntityManagerFactories().containsKey(datasourceName)) {
+                log.debug("  → Skipping already registered: {}", beanName);
+                continue;
+            }
+            
+            mapper.registerEntityManagerFactory(datasourceName, emf);
+            log.info("  → Registered from EntityManagerFactory: {} -> {}", datasourceName, beanName);
+        }
+        
+        // ═══════════════════════════════════════════════════════════════
+        // VALIDASI: Pastikan semua EMF terdaftar
+        // ═══════════════════════════════════════════════════════════════
+        mapper.validateRegistrations();
         
         return mapper;
     }
@@ -443,16 +477,31 @@ public class SaktiTxAutoConfiguration {
     private String extractDatasourceName(String beanName) {
         String lower = beanName.toLowerCase();
         
-        if (lower.contains("db1") || lower.contains("primary") || lower.contains("first")) {
+        // Pattern 1: db1EntityManagerFactory → db1
+        if (lower.contains("db1")) {
             return "db1";
-        } else if (lower.contains("db2") || lower.contains("secondary") || lower.contains("second")) {
+        } else if (lower.contains("db2")) {
             return "db2";
-        } else if (lower.contains("db3") || lower.contains("third")) {
+        } else if (lower.contains("db3")) {
             return "db3";
-        } else if (lower.contains("entitymanager")) {
-            return "default";
         }
         
+        // Pattern 2: db1TransactionManager → db1
+        if (lower.contains("transactionmanager")) {
+            return beanName.replace("TransactionManager", "").replace("transactionManager", "");
+        }
+        
+        // Pattern 3: Primary/Secondary/Third
+        if (lower.contains("primary") || lower.contains("first")) {
+            return "db1";
+        } else if (lower.contains("secondary") || lower.contains("second")) {
+            return "db2";
+        } else if (lower.contains("third")) {
+            return "db3";
+        }
+        
+        // Fallback: gunakan nama asli
+        log.debug("Using original bean name as datasource: {}", beanName);
         return beanName;
     }
     
