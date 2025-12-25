@@ -78,7 +78,7 @@ public class SaktiDistributedTxAspect {
         this.lockManager = lockManager;
         this.preCommitValidator = preCommitValidator;
         this.metrics = metrics;
-        this.allEntityManagers = emMapper.getAllEntityManagers();
+        this.allEntityManagers = emMapper.createEntityManagersForCompensation();
         this.transactionManagers = transactionManagers != null ? transactionManagers : new HashMap<>();
         
         log.info("SaktiDistributedTxAspect initialized (v2.0 - with validation & metrics)");

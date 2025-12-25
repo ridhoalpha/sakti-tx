@@ -28,6 +28,8 @@ import id.go.kemenkeu.djpbn.sakti.tx.starter.service.impl.DistributedLockService
 import id.go.kemenkeu.djpbn.sakti.tx.starter.worker.TransactionRecoveryWorker;
 import jakarta.jms.ConnectionFactory;
 import jakarta.persistence.EntityManager;
+import jakarta.persistence.EntityManagerFactory;
+
 import org.redisson.Redisson;
 import org.redisson.api.RedissonClient;
 import org.redisson.config.Config;
@@ -347,10 +349,10 @@ public class SaktiTxAutoConfiguration {
         
         EntityManagerDatasourceMapper mapper = new EntityManagerDatasourceMapper();
         
-        Map<String, EntityManager> emBeans = ctx.getBeansOfType(EntityManager.class);
-        for (Map.Entry<String, EntityManager> entry : emBeans.entrySet()) {
+        Map<String, EntityManagerFactory> emBeans = ctx.getBeansOfType(EntityManagerFactory.class);
+        for (Map.Entry<String, EntityManagerFactory> entry : emBeans.entrySet()) {
             String datasourceName = extractDatasourceName(entry.getKey());
-            mapper.registerEntityManager(datasourceName, entry.getValue());
+            mapper.registerEntityManagerFactory(datasourceName, entry.getValue());
             log.info("  → Registered: {} -> {}", datasourceName, entry.getKey());
         }
         
@@ -360,11 +362,11 @@ public class SaktiTxAutoConfiguration {
         for (Map.Entry<String, LocalContainerEntityManagerFactoryBean> entry : emfBeans.entrySet()) {
             try {
                 String beanName = entry.getKey();
-                EntityManager em = entry.getValue().getObject().createEntityManager();
+                EntityManagerFactory em = entry.getValue().getObject();
                 String datasourceName = extractDatasourceName(beanName);
                 
-                if (mapper.getAllEntityManagers().get(datasourceName) == null) {
-                    mapper.registerEntityManager(datasourceName, em);
+                if (mapper.getAllEntityManagerFactories().get(datasourceName) == null) {
+                    mapper.registerEntityManagerFactory(datasourceName, em);
                     log.info("  → Registered from factory: {}", datasourceName);
                 }
             } catch (Exception e) {
@@ -384,10 +386,10 @@ public class SaktiTxAutoConfiguration {
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
     public TriggerDetector triggerDetector(EntityManagerDatasourceMapper mapper) {
         log.info("✓ TriggerDetector created");
-        Map<String, EntityManager> entityManagers = mapper.getAllEntityManagers();
-        TriggerDetector detector = new TriggerDetector(entityManagers);
+        Map<String, EntityManagerFactory> entityManagerFactories = 
+            mapper.getAllEntityManagerFactories();
+        TriggerDetector detector = new TriggerDetector(entityManagerFactories);
         
-        // Set static field in EntityOperationListener
         EntityOperationListener.setTriggerDetector(detector);
         
         return detector;
@@ -398,15 +400,13 @@ public class SaktiTxAutoConfiguration {
     @ConditionalOnProperty(prefix = "sakti.tx.multi-db", name = "enabled", havingValue = "true")
     public CascadeDetector cascadeDetector(EntityManagerDatasourceMapper mapper) {
         log.info("✓ CascadeDetector created");
-        Map<String, EntityManager> entityManagers = mapper.getAllEntityManagers();
-        CascadeDetector detector = new CascadeDetector(entityManagers);
-        
-        // Set static field in EntityOperationListener
+        Map<String, EntityManagerFactory> entityManagerFactories =
+        mapper.getAllEntityManagerFactories();
+        CascadeDetector detector = new CascadeDetector(entityManagerFactories);
         EntityOperationListener.setCascadeDetector(detector);
-        
+
         return detector;
     }
-
     // ═══════════════════════════════════════════════════════════════════════════
     // ✅ NEW: PRE-COMMIT VALIDATION BEAN
     // ═══════════════════════════════════════════════════════════════════════════
@@ -421,10 +421,12 @@ public class SaktiTxAutoConfiguration {
         log.info("  → Long Running Threshold: {}ms", properties.getValidation().getLongRunningThresholdMs());
         log.info("  → Strict Version Check: {}", properties.getValidation().isStrictVersionCheck());
         
-        Map<String, EntityManager> entityManagers = mapper.getAllEntityManagers();
+        // SAFE: Pass factories
+        Map<String, EntityManagerFactory> entityManagerFactories = 
+            mapper.getAllEntityManagerFactories();
         Duration threshold = Duration.ofMillis(properties.getValidation().getLongRunningThresholdMs());
         
-        return new DefaultPreCommitValidator(entityManagers, threshold);
+        return new DefaultPreCommitValidator(entityManagerFactories, threshold);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -465,13 +467,16 @@ public class SaktiTxAutoConfiguration {
             @Qualifier("saktiTxObjectMapper") ObjectMapper saktiTxObjectMapper,
             CompensationCircuitBreaker circuitBreaker,
             SaktiTxProperties properties) {
-        log.info("✓ CompensatingTransactionExecutor v2.0 created (with circuit breaker)");
+        log.info("✓ CompensatingTransactionExecutor v2.1 created (thread-safe)");
         
-        Map<String, EntityManager> entityManagers = mapper.getAllEntityManagers();
+        // SAFE: Pass factories, NOT EntityManagers
+        Map<String, EntityManagerFactory> entityManagerFactories = 
+            mapper.getAllEntityManagerFactories();
+        
         boolean strictVersionCheck = properties.getValidation().isStrictVersionCheck();
         
         return new CompensatingTransactionExecutor(
-            entityManagers, 
+            entityManagerFactories, // Changed parameter
             saktiTxObjectMapper, 
             circuitBreaker,
             strictVersionCheck

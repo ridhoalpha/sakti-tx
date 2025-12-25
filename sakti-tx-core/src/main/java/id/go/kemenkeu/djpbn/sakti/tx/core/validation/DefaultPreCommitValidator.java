@@ -7,6 +7,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import jakarta.persistence.EntityManager;
+import jakarta.persistence.EntityManagerFactory;
+
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -19,16 +21,18 @@ public class DefaultPreCommitValidator implements PreCommitValidator {
     
     private static final Logger log = LoggerFactory.getLogger(DefaultPreCommitValidator.class);
     
-    private final Map<String, EntityManager> entityManagers;
+    // CHANGE: Store factories
+    private final Map<String, EntityManagerFactory> entityManagerFactories;
     private final Duration longRunningThreshold;
     
-    public DefaultPreCommitValidator(Map<String, EntityManager> entityManagers) {
-        this(entityManagers, Duration.ofSeconds(30));
+    public DefaultPreCommitValidator(Map<String, EntityManagerFactory> entityManagerFactories) {
+        this(entityManagerFactories, Duration.ofSeconds(30));
     }
     
-    public DefaultPreCommitValidator(Map<String, EntityManager> entityManagers,
-                                    Duration longRunningThreshold) {
-        this.entityManagers = entityManagers;
+    public DefaultPreCommitValidator(
+            Map<String, EntityManagerFactory> entityManagerFactories,
+            Duration longRunningThreshold) {
+        this.entityManagerFactories = entityManagerFactories;
         this.longRunningThreshold = longRunningThreshold;
     }
     
@@ -74,19 +78,20 @@ public class DefaultPreCommitValidator implements PreCommitValidator {
                 continue;
             }
             
-            EntityManager em = entityManagers.get(resource.getName());
-            if (em == null) {
+            EntityManagerFactory emf = entityManagerFactories.get(resource.getName());
+            if (emf == null) {
                 issues.add(ValidationIssue.error(
                     "DB_NOT_FOUND",
-                    "EntityManager not found for resource: " + resource.getName(),
+                    "EntityManagerFactory not found for resource: " + resource.getName(),
                     resource.getName()
                 ));
                 continue;
             }
             
-            try {
-                // Test connectivity with simple query
+            // SAFE: Create temporary EM for validation
+            try (EntityManager em = emf.createEntityManager()) {
                 em.createNativeQuery("SELECT 1").getSingleResult();
+                log.trace("Database connectivity OK: {}", resource.getName());
             } catch (Exception e) {
                 issues.add(ValidationIssue.error(
                     "DB_UNREACHABLE",

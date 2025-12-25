@@ -3,22 +3,22 @@ package id.go.kemenkeu.djpbn.sakti.tx.core.async;
 import id.go.kemenkeu.djpbn.sakti.tx.core.context.SaktiTxContext;
 import id.go.kemenkeu.djpbn.sakti.tx.core.context.SaktiTxContextHolder;
 import id.go.kemenkeu.djpbn.sakti.tx.core.context.SaktiTxContextSnapshot;
+import id.go.kemenkeu.djpbn.sakti.tx.core.wrapper.CheckedSupplier;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import java.util.function.Supplier;
 
 /**
  * Wrapper for Supplier that propagates SAKTI TX context
  */
-public class SaktiTxSupplier<T> implements Supplier<T> {
+public class SaktiTxSupplier<T> implements CheckedSupplier<T> {
     
     private static final Logger log = LoggerFactory.getLogger(SaktiTxSupplier.class);
     
-    private final Supplier<T> delegate;
+    private final CheckedSupplier<T> delegate;
     private final SaktiTxContextSnapshot snapshot;
     
-    public SaktiTxSupplier(Supplier<T> delegate) {
+    public SaktiTxSupplier(CheckedSupplier<T> delegate) {
         this.delegate = delegate;
         this.snapshot = SaktiTxContextHolder.hasContext() 
             ? SaktiTxContextSnapshot.capture() 
@@ -26,7 +26,7 @@ public class SaktiTxSupplier<T> implements Supplier<T> {
     }
     
     @Override
-    public T get() {
+    public T get() throws Exception {
         if (snapshot == null) {
             return delegate.get();
         }

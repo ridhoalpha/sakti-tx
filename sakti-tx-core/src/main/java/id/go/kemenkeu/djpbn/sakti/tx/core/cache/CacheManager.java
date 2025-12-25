@@ -71,6 +71,13 @@ public class CacheManager {
             
             if (bucket.isExists()) {
                 String json = bucket.get();
+                
+                if (json == null || json.trim().isEmpty()) {
+                    log.warn("Cache key {} exists but contains empty data", key);
+                    evict(key);
+                    return null;
+                }
+                
                 T value = objectMapper.readValue(json, typeRef);
                 log.debug("Cache hit: {}", key);
                 return value;
@@ -79,18 +86,44 @@ public class CacheManager {
             log.debug("Cache miss: {}", key);
             return null;
             
+        } catch (com.fasterxml.jackson.databind.JsonMappingException e) {
+            log.error("Cache JSON structure mismatch for key: {} - {}", 
+                key, e.getMessage());
+            log.error("This indicates schema change or corrupted cache data");
+            evictAndLogDetails(key, e);
+            return null;
+            
+        } catch (com.fasterxml.jackson.core.JsonParseException e) {
+            log.error("Cache contains invalid JSON for key: {} - {}", 
+                key, e.getMessage());
+            evictAndLogDetails(key, e);
+            return null;
+            
         } catch (Exception e) {
             log.error("Failed to get cache: {} - EVICTING corrupt cache", key, e);
+            evictAndLogDetails(key, e);
+            return null;
+        }
+    }
+
+    private void evictAndLogDetails(String key, Exception e) {
+        try {
+            String fullKey = prefix + key;
+            RBucket<String> bucket = redissonClient.getBucket(fullKey);
             
-            // AUTO-EVICT corrupt cache
-            try {
-                evict(key);
-                log.info("Evicted corrupt cache: {}", key);
-            } catch (Exception evictError) {
-                log.error("Failed to evict corrupt cache: {}", key, evictError);
+            if (bucket.isExists()) {
+                String corruptData = bucket.get();
+                log.error("Corrupt cache data for key {}: {}", 
+                    key, 
+                    corruptData != null ? corruptData.substring(0, Math.min(200, corruptData.length())) : "null"
+                );
             }
             
-            return null;
+            evict(key);
+            log.info("Evicted corrupt cache: {}", key);
+            
+        } catch (Exception evictError) {
+            log.error("Failed to evict corrupt cache: {}", key, evictError);
         }
     }
     

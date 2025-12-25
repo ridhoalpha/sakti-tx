@@ -3,12 +3,12 @@ package id.go.kemenkeu.djpbn.sakti.tx.core.compensate;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import id.go.kemenkeu.djpbn.sakti.tx.core.log.TransactionLog;
 import id.go.kemenkeu.djpbn.sakti.tx.core.log.TransactionLog.OperationLog;
-import id.go.kemenkeu.djpbn.sakti.tx.core.risk.RiskFlag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
 import jakarta.persistence.EntityManager;
+import jakarta.persistence.EntityManagerFactory;
 import jakarta.persistence.Query;
 import jakarta.persistence.criteria.CriteriaBuilder;
 import jakarta.persistence.criteria.CriteriaQuery;
@@ -26,26 +26,26 @@ public class CompensatingTransactionExecutor {
     
     private static final Logger log = LoggerFactory.getLogger(CompensatingTransactionExecutor.class);
     
-    private final Map<String, EntityManager> entityManagers;
+    private final Map<String, EntityManagerFactory> entityManagerFactories;
     private final ObjectMapper objectMapper;
     private final CompensationCircuitBreaker circuitBreaker;
     private final boolean strictVersionCheck;
     
     public CompensatingTransactionExecutor(
-            Map<String, EntityManager> entityManagers,
+            Map<String, EntityManagerFactory> entityManagerFactories,
             ObjectMapper objectMapper,
             CompensationCircuitBreaker circuitBreaker,
             boolean strictVersionCheck) {
-        this.entityManagers = entityManagers;
+        this.entityManagerFactories = entityManagerFactories;
         this.objectMapper = objectMapper;
         this.circuitBreaker = circuitBreaker;
         this.strictVersionCheck = strictVersionCheck;
         
-        log.info("CompensatingTransactionExecutor initialized (version-aware, business-key, soft-delete)");
+        log.info("CompensatingTransactionExecutor initialized (v2.1 - thread-safe)");
     }
     
     /**
-     * ENHANCED: Rollback with circuit breaker
+     * SAFE: Rollback with proper EntityManager lifecycle
      */
     public void rollback(TransactionLog txLog) {
         String txId = txLog.getTxId();
@@ -65,107 +65,196 @@ public class CompensatingTransactionExecutor {
         log.warn("Total Operations: {}", txLog.getOperations().size());
         log.warn("═══════════════════════════════════════════════════════════");
         
-        List<OperationLog> operations = txLog.getOperationsInReverseOrder();
-        RollbackResult result = new RollbackResult();
-        List<CompensationError> criticalErrors = new ArrayList<>();
+        // SAFE: Create NEW EntityManagers for compensation
+        Map<String, EntityManager> entityManagers = createCompensationEntityManagers();
         
-        for (int i = 0; i < operations.size(); i++) {
-            OperationLog op = operations.get(i);
-            
-            MDC.put("opSequence", String.valueOf(op.getSequence()));
-            MDC.put("opType", op.getOperationType().toString());
-            
+        // SAFE: Start local transactions for compensation
+        Map<String, jakarta.persistence.EntityTransaction> transactions = new HashMap<>();
+        for (Map.Entry<String, EntityManager> entry : entityManagers.entrySet()) {
             try {
-                if (op.isCompensated()) {
-                    log.debug("Skip already compensated: {} [id={}]", 
-                        op.getEntityClass(), op.getEntityId());
-                    result.skipped++;
-                    continue;
-                }
-                
-                log.info("Compensating operation {}/{}: {} {} [id={}] on {}", 
-                    i + 1, operations.size(),
-                    op.getOperationType(), 
-                    op.getEntityClass(), 
-                    op.getEntityId(),
-                    op.getDatasource());
-                
-                compensateOperationSafe(op);
-                
-                op.setCompensated(true);
-                result.successful++;
-                
-                log.info("✓ Compensation successful: {} {} [id={}]", 
-                    op.getOperationType(), op.getEntityClass(), op.getEntityId());
-                
-            } catch (FatalCompensationException fatal) {
-                op.setCompensationError(fatal.getMessage());
-                result.failed++;
-                
-                CompensationError error = new CompensationError(
-                    op, fatal, true, i + 1, operations.size()
-                );
-                criticalErrors.add(error);
-                
-                logFatalError(error);
-                
-                // Record circuit breaker failure
-                circuitBreaker.recordFailure(txId);
-                
-                break; // Stop rollback
-                
-            } catch (RetryableCompensationException retryable) {
-                op.setCompensationError(retryable.getMessage());
-                result.failed++;
-                
-                CompensationError error = new CompensationError(
-                    op, retryable, false, i + 1, operations.size()
-                );
-                criticalErrors.add(error);
-                
-                logRetryableError(error);
-                
-                // Continue with next operation
-                
-            } catch (Exception unknown) {
-                op.setCompensationError(unknown.getMessage());
-                result.failed++;
-                
-                CompensationError error = new CompensationError(
-                    op, unknown, true, i + 1, operations.size()
-                );
-                criticalErrors.add(error);
-                
-                logUnknownError(error);
-                
-                circuitBreaker.recordFailure(txId);
-                break;
-                
-            } finally {
-                MDC.remove("opSequence");
-                MDC.remove("opType");
+                EntityManager em = entry.getValue();
+                jakarta.persistence.EntityTransaction tx = em.getTransaction();
+                tx.begin();
+                transactions.put(entry.getKey(), tx);
+                log.debug("Started compensation transaction for: {}", entry.getKey());
+            } catch (Exception e) {
+                log.error("Failed to start compensation transaction: {}", entry.getKey(), e);
             }
         }
         
-        logRollbackSummary(txId, result);
-        
-        MDC.remove("txId");
-        
-        if (!criticalErrors.isEmpty()) {
-            throw new PartialRollbackException(
-                txId, result, criticalErrors,
-                "Rollback partially failed: " + result.failed + "/" + operations.size()
-            );
+        try {
+            List<OperationLog> operations = txLog.getOperationsInReverseOrder();
+            RollbackResult result = new RollbackResult();
+            List<CompensationError> criticalErrors = new ArrayList<>();
+            
+            for (int i = 0; i < operations.size(); i++) {
+                OperationLog op = operations.get(i);
+                
+                MDC.put("opSequence", String.valueOf(op.getSequence()));
+                MDC.put("opType", op.getOperationType().toString());
+                
+                try {
+                    if (op.isCompensated()) {
+                        log.debug("Skip already compensated: {} [id={}]", 
+                            op.getEntityClass(), op.getEntityId());
+                        result.skipped++;
+                        continue;
+                    }
+                    
+                    log.info("Compensating operation {}/{}: {} {} [id={}] on {}", 
+                        i + 1, operations.size(),
+                        op.getOperationType(), 
+                        op.getEntityClass(), 
+                        op.getEntityId(),
+                        op.getDatasource());
+                    
+                    // Use EntityManager from compensation map
+                    compensateOperationSafe(op, entityManagers);
+                    
+                    op.setCompensated(true);
+                    result.successful++;
+                    
+                    log.info("✓ Compensation successful: {} {} [id={}]", 
+                        op.getOperationType(), op.getEntityClass(), op.getEntityId());
+                    
+                } catch (FatalCompensationException fatal) {
+                    op.setCompensationError(fatal.getMessage());
+                    result.failed++;
+                    
+                    CompensationError error = new CompensationError(
+                        op, fatal, true, i + 1, operations.size()
+                    );
+                    criticalErrors.add(error);
+                    
+                    logFatalError(error);
+                    circuitBreaker.recordFailure(txId);
+                    break;
+                    
+                } catch (RetryableCompensationException retryable) {
+                    op.setCompensationError(retryable.getMessage());
+                    result.failed++;
+                    
+                    CompensationError error = new CompensationError(
+                        op, retryable, false, i + 1, operations.size()
+                    );
+                    criticalErrors.add(error);
+                    
+                    logRetryableError(error);
+                    
+                } catch (Exception unknown) {
+                    op.setCompensationError(unknown.getMessage());
+                    result.failed++;
+                    
+                    CompensationError error = new CompensationError(
+                        op, unknown, true, i + 1, operations.size()
+                    );
+                    criticalErrors.add(error);
+                    
+                    logUnknownError(error);
+                    circuitBreaker.recordFailure(txId);
+                    break;
+                    
+                } finally {
+                    MDC.remove("opSequence");
+                    MDC.remove("opType");
+                }
+            }
+            
+            // COMMIT compensation transactions
+            for (Map.Entry<String, jakarta.persistence.EntityTransaction> entry : transactions.entrySet()) {
+                try {
+                    if (entry.getValue().isActive()) {
+                        entry.getValue().commit();
+                        log.debug("Committed compensation transaction: {}", entry.getKey());
+                    }
+                } catch (Exception e) {
+                    log.error("Failed to commit compensation transaction: {}", 
+                        entry.getKey(), e);
+                }
+            }
+            
+            logRollbackSummary(txId, result);
+            
+            if (!criticalErrors.isEmpty()) {
+                throw new PartialRollbackException(
+                    txId, result, criticalErrors,
+                    "Rollback partially failed: " + result.failed + "/" + operations.size()
+                );
+            }
+            
+            circuitBreaker.recordSuccess(txId);
+            log.info("✓ Rollback completed successfully for txId: {}", txId);
+            
+        } catch (Exception e) {
+            // ROLLBACK compensation transactions on error
+            for (Map.Entry<String, jakarta.persistence.EntityTransaction> entry : transactions.entrySet()) {
+                try {
+                    if (entry.getValue().isActive()) {
+                        entry.getValue().rollback();
+                        log.debug("Rolled back compensation transaction: {}", entry.getKey());
+                    }
+                } catch (Exception rollbackError) {
+                    log.error("Failed to rollback compensation transaction: {}", 
+                        entry.getKey(), rollbackError);
+                }
+            }
+            throw e;
+            
+        } finally {
+            // CLOSE all EntityManagers
+            for (Map.Entry<String, EntityManager> entry : entityManagers.entrySet()) {
+                try {
+                    if (entry.getValue().isOpen()) {
+                        entry.getValue().close();
+                        log.trace("Closed compensation EntityManager: {}", entry.getKey());
+                    }
+                } catch (Exception e) {
+                    log.error("Failed to close compensation EntityManager: {}", 
+                        entry.getKey(), e);
+                }
+            }
+            
+            MDC.remove("txId");
         }
-        
-        // Record success
-        circuitBreaker.recordSuccess(txId);
-        
-        log.info("✓ Rollback completed successfully for txId: {}", txId);
     }
     
-    private void compensateOperationSafe(OperationLog op) throws CompensationException {
-        EntityManager em = getEntityManager(op.getDatasource());
+    /**
+     * SAFE: Create EntityManagers for compensation
+     */
+    private Map<String, EntityManager> createCompensationEntityManagers() {
+        Map<String, EntityManager> entityManagers = new HashMap<>();
+        
+        for (Map.Entry<String, EntityManagerFactory> entry : entityManagerFactories.entrySet()) {
+            String datasource = entry.getKey();
+            EntityManagerFactory emf = entry.getValue();
+            
+            // Skip duplicate entries (aliases)
+            if (datasource.endsWith("TransactionManager") && 
+                entityManagerFactories.containsKey(datasource.replace("TransactionManager", ""))) {
+                continue;
+            }
+            
+            try {
+                EntityManager em = emf.createEntityManager();
+                entityManagers.put(datasource, em);
+                log.trace("Created compensation EntityManager for: {}", datasource);
+            } catch (Exception e) {
+                log.error("Failed to create compensation EntityManager: {}", 
+                    datasource, e);
+            }
+        }
+        
+        return entityManagers;
+    }
+    
+    /**
+     * Modified to accept entityManagers map
+     */
+    private void compensateOperationSafe(OperationLog op, 
+                                         Map<String, EntityManager> entityManagers) 
+            throws CompensationException {
+        
+        EntityManager em = getEntityManager(op.getDatasource(), entityManagers);
         
         try {
             switch (op.getOperationType()) {
@@ -521,26 +610,39 @@ public class CompensatingTransactionExecutor {
         }
     }
     
-    // ========================================================================
-    // Helper methods
-    // ========================================================================
-    
-    private EntityManager getEntityManager(String datasource) throws FatalCompensationException {
+    /**
+     * SAFE: Get EntityManager from compensation map
+     */
+    private EntityManager getEntityManager(String datasource, 
+                                           Map<String, EntityManager> entityManagers) 
+            throws FatalCompensationException {
+        
         EntityManager em = entityManagers.get(datasource);
         
         if (em == null) {
-            String available = String.join(", ", entityManagers.keySet());
-            throw new FatalCompensationException(
-                String.format(
-                    "No EntityManager found for datasource '%s'. Available: [%s]",
-                    datasource, available
-                )
-            );
+            // Try with/without "TransactionManager" suffix
+            if (datasource.endsWith("TransactionManager")) {
+                String shortName = datasource.replace("TransactionManager", "");
+                em = entityManagers.get(shortName);
+            } else {
+                String longName = datasource + "TransactionManager";
+                em = entityManagers.get(longName);
+            }
+            
+            if (em == null) {
+                String available = String.join(", ", entityManagers.keySet());
+                throw new FatalCompensationException(
+                    String.format(
+                        "No EntityManager found for datasource '%s'. Available: [%s]",
+                        datasource, available
+                    )
+                );
+            }
         }
         
         return em;
     }
-    
+
     private Object extractVersion(Object entity) {
         try {
             for (Field field : entity.getClass().getDeclaredFields()) {

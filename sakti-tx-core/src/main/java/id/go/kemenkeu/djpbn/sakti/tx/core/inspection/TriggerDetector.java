@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import jakarta.persistence.EntityManager;
+import jakarta.persistence.EntityManagerFactory;
 import jakarta.persistence.Query;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -18,10 +19,11 @@ public class TriggerDetector {
     
     // Cache: tableName -> hasTriggers
     private final Map<String, Boolean> triggerCache = new ConcurrentHashMap<>();
-    private final Map<String, EntityManager> entityManagers;
+    // CHANGE: Store factories
+    private final Map<String, EntityManagerFactory> entityManagerFactories;
     
-    public TriggerDetector(Map<String, EntityManager> entityManagers) {
-        this.entityManagers = entityManagers;
+    public TriggerDetector(Map<String, EntityManagerFactory> entityManagerFactories) {
+        this.entityManagerFactories = entityManagerFactories;
     }
     
     /**
@@ -31,18 +33,30 @@ public class TriggerDetector {
         String cacheKey = datasource + ":" + tableName;
         
         return triggerCache.computeIfAbsent(cacheKey, k -> {
-            EntityManager em = entityManagers.get(datasource);
-            if (em == null) {
-                log.warn("No EntityManager for datasource: {}", datasource);
+            EntityManagerFactory emf = entityManagerFactories.get(datasource);
+            if (emf == null) {
+                log.warn("No EntityManagerFactory for datasource: {}", datasource);
                 return false;
             }
             
+            // SAFE: Create temporary EM
+            EntityManager em = null;
             try {
+                em = emf.createEntityManager();
                 return detectTriggers(em, tableName);
             } catch (Exception e) {
                 log.warn("Failed to detect triggers for {}.{}: {}", 
                     datasource, tableName, e.getMessage());
-                return false; // Assume no triggers on error
+                return false;
+            } finally {
+                // CLOSE temporary EM
+                if (em != null && em.isOpen()) {
+                    try {
+                        em.close();
+                    } catch (Exception e) {
+                        log.warn("Failed to close trigger detection EntityManager");
+                    }
+                }
             }
         });
     }
@@ -97,12 +111,13 @@ public class TriggerDetector {
      * Get trigger details (for logging)
      */
     public List<TriggerInfo> getTriggerDetails(String datasource, String tableName) {
-        EntityManager em = entityManagers.get(datasource);
-        if (em == null) {
+        EntityManagerFactory emf = entityManagerFactories.get(datasource);
+        if (emf == null) {
+            log.warn("No EntityManagerFactory for datasource: {}", datasource);
             return Collections.emptyList();
         }
-        
-        try {
+
+        try (EntityManager em = emf.createEntityManager()) {
             // Oracle
             String sql = 
                 "SELECT TRIGGER_NAME, TRIGGERING_EVENT, TRIGGER_TYPE " +

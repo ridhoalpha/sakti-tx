@@ -3,7 +3,7 @@ package id.go.kemenkeu.djpbn.sakti.tx.core.inspection;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import jakarta.persistence.EntityManager;
+import jakarta.persistence.EntityManagerFactory;
 import jakarta.persistence.metamodel.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -17,10 +17,10 @@ public class CascadeDetector {
     
     // Cache: entityClass -> hasCascade
     private final Map<Class<?>, CascadeInfo> cascadeCache = new ConcurrentHashMap<>();
-    private final Map<String, EntityManager> entityManagers;
+    private final Map<String, EntityManagerFactory> entityManagerFactories;
     
-    public CascadeDetector(Map<String, EntityManager> entityManagers) {
-        this.entityManagers = entityManagers;
+    public CascadeDetector(Map<String, EntityManagerFactory> entityManagerFactories) {
+        this.entityManagerFactories = entityManagerFactories;
     }
     
     /**
@@ -32,19 +32,15 @@ public class CascadeDetector {
     
     private CascadeInfo analyzeCascade(Class<?> entityClass) {
         CascadeInfo info = new CascadeInfo(entityClass);
-        
-        // Find any EntityManager to get metamodel
-        EntityManager em = entityManagers.values().stream()
-            .findFirst()
-            .orElse(null);
-        
-        if (em == null) {
-            log.warn("No EntityManager available for cascade detection");
+
+        EntityManagerFactory emf = findEmfForEntity(entityClass);
+        if (emf == null) {
+            log.warn("No EntityManagerFactory found for {}", entityClass.getName());
             return info;
         }
         
         try {
-            Metamodel metamodel = em.getMetamodel();
+            Metamodel metamodel = emf.getMetamodel();
             EntityType<?> entityType = metamodel.entity(entityClass);
             
             // Check all attributes
@@ -101,6 +97,18 @@ public class CascadeDetector {
         }
         
         return info;
+    }
+
+    private EntityManagerFactory findEmfForEntity(Class<?> entityClass) {
+        for (EntityManagerFactory emf : entityManagerFactories.values()) {
+            try {
+                emf.getMetamodel().entity(entityClass);
+                return emf;
+            } catch (IllegalArgumentException ignored) {
+                // Not managed by this EMF
+            }
+        }
+        return null;
     }
     
     private <T extends java.lang.annotation.Annotation> T getAnnotation(

@@ -4,6 +4,7 @@ import id.go.kemenkeu.djpbn.sakti.tx.core.exception.IdempotencyException;
 import id.go.kemenkeu.djpbn.sakti.tx.core.exception.LockAcquisitionException;
 import id.go.kemenkeu.djpbn.sakti.tx.core.idempotency.IdempotencyManager;
 import id.go.kemenkeu.djpbn.sakti.tx.core.lock.LockManager;
+import id.go.kemenkeu.djpbn.sakti.tx.core.wrapper.CheckedSupplier;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.config.SaktiTxProperties;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.health.DragonflyHealthIndicator;
 import id.go.kemenkeu.djpbn.sakti.tx.starter.service.DistributedLockService;
@@ -35,7 +36,7 @@ public class DistributedLockServiceImpl implements DistributedLockService {
     }
     
     @Override
-    public <T> T executeWithLock(String lockKey, Supplier<T> action) throws Exception {
+    public <T> T executeWithLock(String lockKey, CheckedSupplier<T> action) throws Exception {
         return executeWithLock(lockKey, 
             properties.getLock().getWaitTimeMs(), 
             properties.getLock().getLeaseTimeMs(), 
@@ -44,7 +45,7 @@ public class DistributedLockServiceImpl implements DistributedLockService {
     
     @Override
     public <T> T executeWithLock(String lockKey, long waitTimeMs, long leaseTimeMs, 
-                                Supplier<T> action) throws Exception {
+                                CheckedSupplier<T> action) throws Exception {
         boolean circuitOpen = healthIndicator != null && healthIndicator.isCircuitOpen();
         
         if (!properties.getLock().isEnabled() || circuitOpen) {
@@ -77,7 +78,7 @@ public class DistributedLockServiceImpl implements DistributedLockService {
     
     @Override
     public <T> T executeWithLockAndIdempotency(String lockKey, String idempotencyKey,
-                                              Supplier<T> action) throws Exception {
+                                              CheckedSupplier<T> action) throws Exception {
         // Check if idempotency is available
         if (idempotencyManager == null || !properties.getIdempotency().isEnabled()) {
             log.warn("IdempotencyManager not available - executing with lock only");
